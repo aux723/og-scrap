@@ -1,0 +1,23 @@
+{
+  "name": "puppeteer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google/genai": "^1.22.0",
+    "mongodb": "^6.18.0",
+    "node-cron": "^4.2.1",
+    "puppeteer": "^24.12.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-adblocker": "^2.13.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "telegraf": "^4.16.3",
+    "user-agents": "^1.1.603"
+  }
+}

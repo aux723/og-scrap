@@ -1,0 +1,7 @@
+develop different post models for twitter and telegram
+for each link, navigate to the page and scrap the scholarship data
+only scrap the current year page
+keep graduate, phd and postdoc positions
+delete each post 6 months from date of post
+for each position extract key data such as position, institution, contact email or link, application deadline (if available)
+goin three levels up you must chain the path ; instead of .../, use ../../
