@@ -22,7 +22,7 @@ let db; // This variable will hold the database instance once connected
 async function initializeDatabase() {
   try {
     await client.connect();
-    db = client.db("Jobs-visa-co-uk");
+    db = client.db("aesop");
 
     // Create indexes for better query performance
     await createIndexes();
@@ -38,35 +38,24 @@ async function initializeDatabase() {
  */
 async function createIndexes() {
   try {
-    const jobsCollection = db.collection("Jobs");
+    let aSPCollection = await db.collection("aesop-posted-scholarships");
+    let aSCollection = db.collection("aesop-scholarships");
 
-    // Create indexes for Jobs collection
-    const jobsIndexes = [
-      { key: { link: 1 }, name: "link_index", background: true },
-      { key: { deadline: 1 }, name: "deadline_index", background: true },
-      { key: { uploadedDate: 1 }, name: "uploadedDate_index", background: true }
-    ];
+    // Create indexes in parallel for better performance
+    await Promise.all([
+        aSPCollection.createIndex({ post_title: 1 }, { background: true }),
+        aSPCollection.createIndex({ application_deadline: 1 }, { background: true }),
+        aSPCollection.createIndex({ postLink: 1 }, { unique: true, background: true }),
+        aSCollection.createIndex({ post_title: 1 }, { background: true }),
+        aSCollection.createIndex({ application_deadline: 1 }, { background: true }),
+        aSCollection.createIndex({ postLink: 1 }, { unique: true, background: true }),
+    ]);
 
-    // Check if Jobs collection exists and create indexes
-    const collections = await db.listCollections({ name: "Jobs" }).toArray();
-    if (collections.length > 0) {
-      console.log("📊 Creating indexes for Jobs collection...");
-      await Promise.all(
-        jobsIndexes.map(index =>
-          jobsCollection.createIndex(index.key, {
-            name: index.name,
-            background: true
-          })
-        )
-      );
-    } else {
-      console.log("ℹ️ Jobs collection does not exist yet. Indexes will be created when collection is created.");
-    }
-
+    console.log("✅ Database indexing configuration completed");
+    return;
     // For Posted-Jobs, we'll create the index when the collection is first used
     // This is handled in addDocumentToPostedDb function
 
-    console.log("✅ Database indexing configuration completed");
   } catch (error) {
     console.error("⛔ Error configuring indexes:", error);
     // Non-critical error, don't throw
@@ -84,62 +73,27 @@ async function closeDatabase() {
   } catch (error) {
     console.error("⛔ Error closing MongoDB connection:", error);
     process.exit(1);
-  } 
-}
-
-async function storeJob(job) {
-
-  try {
-
-    // Attempt to insert the document
-    // The unique index on 'link' will automatically prevent duplicates
-    const result = await db.collection("Jobs").insertOne({
-      ...job,
-      createdAt: new Date()
-    });
-
-    return {
-      success: true,
-      message: "Job stored successfully",
-      jobId: result.insertedId
-    };
-
-  } catch (error) {
-    // Check if the error is a duplicate key error
-    if (error.code === 11000) {
-      return {
-        success: false,
-        message: "Job already exists in database",
-        duplicate: true
-      };
-    }
-
-    // For other errors
-    console.error("Error storing job:", error);
-    return {
-      success: false,
-      message: "Failed to store job",
-      error: error.message
-    };
   }
 }
+
+
 
 /**
  * Adds a document to the 'Posted-Jobs' collection with optimized insertion.
  * Creates collection and indexes if they don't exist.
  * @param {object} jobDocument - The job document that was posted.
  */
-async function addDocumentToPostedDb(jobDocument) {
+async function addDocumentToPostedDb(postDocument) {
 
   try {
-    const collection = db.collection("Posted-Jobs");
+    const collection = db.collection("aesop-posted-scholarships");
 
     // Create index if collection is new
-    const collections = await db.listCollections({ name: "Posted-Jobs" }).toArray();
+    const collections = await db.listCollections({ name: "aesop-posted-scholarships" }).toArray();
     if (collections.length === 0) {
       console.log("📊 Creating new Posted-Jobs collection with indexes...");
       await collection.createIndex(
-        { link: 1 },
+        { postLink: 1 },
         {
           name: "posted_link_index",
           background: true
@@ -148,12 +102,12 @@ async function addDocumentToPostedDb(jobDocument) {
     }
 
     // Use insertOne with writeConcern for better performance
-    const result = await collection.insertOne(jobDocument, {
+    const result = await collection.insertOne(postDocument, {
       writeConcern: { w: 1, j: false }
     });
 
     console.log(`📝 Document added to PostedDb with ID: ${result.insertedId}`);
-    return result.insertedId;
+    return {success: true};
   } catch (error) {
     console.error("⛔ Error adding document to Posted-Jobs:", error);
     process.exit(1);
@@ -168,17 +122,17 @@ async function addDocumentToPostedDb(jobDocument) {
 async function findRandomUnpostedDocument() {
 
   try {
-    const collection = db.collection("Jobs");
+    const collection = db.collection("aesop-scholarships");
 
     // Optimized pipeline with better memory usage
     const pipeline = [
       // Use $lookup with pipeline for better performance
       {
         $lookup: {
-          from: "Posted-Jobs",
-          let: { jobLink: "$link" },
+          from: "aesop-posted-scholarships",
+          let: { Link: "$postLink" },
           pipeline: [
-            { $match: { $expr: { $eq: ["$link", "$$jobLink"] } } },
+            { $match: { $expr: { $eq: ["$postLink", "$$Link"] } } },
             { $limit: 1 },
             { $project: { _id: 1 } }
           ],
@@ -212,25 +166,25 @@ async function findRandomUnpostedDocument() {
  * Deletes all documents from the 'Posted-Jobs' collection if count exceeds threshold.
  * Uses efficient counting and bulk operations.
  */
-async function deleteAllPostedJobsFromDb() {
+async function deleteAllPostedAScholarshipsFromDb() {
 
   try {
-    const collection = db.collection("Posted-Jobs");
+    const collection = db.collection("aesop-posted-scholarships");
 
     // Use estimatedDocumentCount for better performance on large collections
     const count = await collection.estimatedDocumentCount();
 
     if (count >= 3000) {
-      console.log(`🗑️ Posted-Jobs collection has ~${count} documents. Deleting...`);
+      console.log(`🗑️ aesop-posted-scholarships collection has ~${count} documents. Deleting...`);
 
       const result = await collection.deleteMany({}, {
         writeConcern: { w: 1, j: false }
       });
 
-      console.log(`✅ Deleted ${result.deletedCount} documents from Posted-Jobs.`);
+      console.log(`✅ Deleted ${result.deletedCount} documents from aesop-posted-scholarships.`);
       return;
     } else {
-      console.log(`ℹ️ Posted-Jobs collection has ~${count} documents. No deletion needed.`);
+      console.log(`ℹ️ aesop-posted-scholarships has ~${count} documents. No deletion needed.`);
       return;
     }
 
@@ -338,7 +292,7 @@ async function removeOldDocumentsFromDb() {
  * @returns {Promise<number>} Number of documents deleted
  */
 async function removeUnspecifiedDeadlineJobs() {
-  
+
   try {
     const collection = db.collection("Jobs");
     const twelveDaysAgo = new Date();

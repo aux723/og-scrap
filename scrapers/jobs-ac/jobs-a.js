@@ -1,11 +1,13 @@
 
-
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 puppeteer.use(StealthPlugin());
 const AdblockerPlugin = require('puppeteer-extra-plugin-adblocker')
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }))
 const UserAgent = require("user-agents");
+const { formatDateForDB } = require('../../utils/dateHelpers.js');
+const { storePosts, initializeDatabase,
+  closeDatabase } = require('./jobs-ac-db.js');
 
 {/**UTILITIES START */}
 function trimInst(text) {
@@ -85,8 +87,111 @@ function getValidDeadline(deadlineString) {
   return parsedDate >= currentDate ? parsedDate : null;
 };
 
-async function scrapeAllPages(page, startUrl, maxPages = 2) {
-  let allLinks = [];
+async function extractPostDetails (postLink, page) {
+  //extraction of post details in second page from the post primary link scrapped from first page
+  console.log(`post link: ${postLink}`);
+  await page.goto(`${postLink}`, {
+    waitUntil: "domcontentloaded",
+  });
+
+  await page.waitForSelector(".j-advert__title", {
+    visible: true,
+    timeout: 0,
+  });
+
+  let post_title = await page.evaluate(() => {
+    const element = document.querySelector('.j-advert__title');
+    return element ? element.textContent : null;
+  });
+
+  post_title = cleanPhdTitle(post_title);
+
+  //check if post_title contains this string, "Phd Studentship:", replace with empty string and trim
+  let post_position = await page.evaluate(() => {
+    const element = document.querySelector('#qualification');
+    return element ? element.textContent : null;
+  });
+
+
+  let post_Inst = await page.evaluate(() => {
+    const element = document.querySelector('.j-advert__employer');
+    return element ? element.textContent : null;
+  });
+
+  post_Inst = trimInst(post_Inst);
+
+  let app_link = await page.evaluate(() => {
+    const element = document.querySelector('.row-7 > a');
+    return element ? element.href : null;
+  });
+
+  let post_deadline = await page.evaluate(() => {
+    const element = document.querySelector('body > div.grid.grid__2-col.grid__2-col--left.grid__2-col--large-right.ie11-min-width > div.sub-grid.column-1.edge-span-2-mobile > div.j-advert-details__container.row-5 > div > div.j-advert-details__second-col > table > tbody > tr:nth-child(2) > td');
+    return element ? element.textContent : null;
+  });
+
+  const validDeadline = getValidDeadline(post_deadline);
+
+  if (!validDeadline) {
+    console.log(`⏭️ SKIPPING: Deadline "${post_deadline}" is expired or invalid - ${post_title}`);
+    return null; // Skip this post
+  }
+
+  let data = {
+    position: post_position,
+    post_title: post_title,
+    institution: post_Inst,
+    application_link: app_link,
+    application_deadline: post_deadline,     //rolling posts deleted at the end of the scrap year (db code using the extracted year to delete post from db)
+    postLink: `${postLink}`,
+    insertionDate: formatDateForDB()
+  };
+
+  return data;
+
+};
+
+async function scrapeAllPages(startUrl, maxPages = 2) {
+
+try {
+
+  let browser;
+  browser = await puppeteer.launch({
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--disable-gpu',
+    '--disable-web-security',
+    '--disable-features=VizDisplayCompositor',
+    '--single-process',
+  ],
+  handleSIGINT: false,
+  handleSIGTERM: false,
+  handleSIGHUP: false,
+});
+
+  let page;
+  page = await browser.newPage();
+  // remove timeout limit
+  page.setDefaultNavigationTimeout(0);
+
+  // Block images, stylesheets, and fonts to save memory and bandwidth
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
+  let userAgent = new UserAgent({ deviceCategory: "mobile" }); //desktop
+  let randomAgent = userAgent.toString();
+  await page.setUserAgent(randomAgent);
+  //let allLinks = [];
   let currentUrl = startUrl;
   let pageNum = 1;
 
@@ -117,165 +222,16 @@ async function scrapeAllPages(page, startUrl, maxPages = 2) {
       return extractedLinks;
     });
 
+    //batch store here
+
     console.log(`✅ Found ${links.length} links on page ${pageNum}`);
-    allLinks.push(...links);
-
-    // Try to find the next page link
-    const nextPageLink = await page.evaluate(() => {
-      const nextButton = document.querySelector("#results > div.j-search-content__pagination.j-search-content__pagination--center.j-search-content__results-footer > div > span > a");
-      if (nextButton && nextButton.href) {
-        return nextButton.href;
-      }
-      return null;
-    });
-
-    if (nextPageLink && pageNum < maxPages) {
-      console.log(`🔗 Next page link found: `); //${nextPageLink}
-      currentUrl = nextPageLink;
-      pageNum++;
-
-      // Add delay between page requests
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } else {
-      console.log(`📌 No more pages or reached max pages (${maxPages})`);
-      break;
-    }
-  }
-
-  console.log(`\n📊 Total links collected from ${pageNum} page(s): ${allLinks.length}`);
-  return allLinks;
-}
-
-{/**UTILITIES eND */}
-
-async function get_jobs_ac_data () {
-
-
-    let browser;
-    browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--disable-web-security',
-      '--disable-features=VizDisplayCompositor',
-      '--single-process',
-    ],
-    handleSIGINT: false,
-    handleSIGTERM: false,
-    handleSIGHUP: false,
-  });
-
-
-  let page;
-
-  try {
-    page = await browser.newPage();
-    // remove timeout limit
-    page.setDefaultNavigationTimeout(0);
-
-    // Block images, stylesheets, and fonts to save memory and bandwidth
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    let userAgent = new UserAgent({ deviceCategory: "mobile" }); //desktop
-    let randomAgent = userAgent.toString();
-    await page.setUserAgent(randomAgent);
-
-    const baseUrl = "https://www.jobs.ac.uk/search/?academicDisciplineFacet[0]=psychology&academicDisciplineFacet[1]=physical-and-environmental-sciences&subDisciplineFacet[0]=geography&academicDisciplineFacet[2]=mathematics-and-statistics&subDisciplineFacet[1]=mathematics&subDisciplineFacet[2]=statistics&academicDisciplineFacet[3]=computer-sciences&subDisciplineFacet[3]=computer-science&subDisciplineFacet[4]=information-systems&subDisciplineFacet[5]=artificial-intelligence&subDisciplineFacet[6]=cyber-security&academicDisciplineFacet[4]=engineering-and-technology&subDisciplineFacet[7]=other-engineering&academicDisciplineFacet[5]=architecture-building-and-planning&subDisciplineFacet[8]=urban-and-rural-planning&academicDisciplineFacet[6]=economics&academicDisciplineFacet[7]=social-sciences-and-social-care&subDisciplineFacet[9]=sociology&subDisciplineFacet[10]=social-policy&subDisciplineFacet[11]=human-and-social-geography&academicDisciplineFacet[8]=information-management-and-librarianship&subDisciplineFacet[12]=information-science&jobTypeFacet[0]=phds&expired-job-redirect=true";
-
-    // Scrape all pages (max 8 pages as requested)
-    const allLinks = await scrapeAllPages(page, baseUrl, 3);
-
-    if (allLinks.length > 0) {
-      console.log(`\n✅ Total links collected: ${allLinks.length}`);
-    } else {
-      console.log('❌ No data to scrape');
-      return;
-    }
-
-    // Optional: Limit for testing
-    const linksToProcess = allLinks.slice(34, 55); // Process first 10 links
-    console.log(`📌 Processing first ${linksToProcess.length} links for testing`);
+    console.log(`proceeding to process ${links.length} links..`); //links = links.splice(0, 3);
     let postsDetailsArr = [];
 
-    async function extractPostDetails (postLink) {
-      //extraction of post details in second page from the post primary link scrapped from first page
-      console.log(`post link: ${postLink}`);
-      await page.goto(`${postLink}`, {
-        waitUntil: "domcontentloaded",
-      });
-
-      await page.waitForSelector(".j-advert__title", {
-        visible: true,
-        timeout: 0,
-      });
-
-      let post_title = await page.evaluate(() => {
-        const element = document.querySelector('.j-advert__title');
-        return element ? element.textContent : null;
-      });
-
-      post_title = cleanPhdTitle(post_title);
-
-      //check if post_title contains this string, "Phd Studentship:", replace with empty string and trim
-      let post_position = await page.evaluate(() => {
-        const element = document.querySelector('#qualification');
-        return element ? element.textContent : null;
-      });
-
-
-      let post_Inst = await page.evaluate(() => {
-        const element = document.querySelector('.j-advert__employer');
-        return element ? element.textContent : null;
-      });
-
-      post_Inst = trimInst(post_Inst);
-
-      let app_link = await page.evaluate(() => {
-        const element = document.querySelector('.row-7 > a');
-        return element ? element.href : null;
-      });
-
-      let post_deadline = await page.evaluate(() => {
-        const element = document.querySelector('body > div.grid.grid__2-col.grid__2-col--left.grid__2-col--large-right.ie11-min-width > div.sub-grid.column-1.edge-span-2-mobile > div.j-advert-details__container.row-5 > div > div.j-advert-details__second-col > table > tbody > tr:nth-child(2) > td');
-        return element ? element.textContent : null;
-      });
-
-      const validDeadline = getValidDeadline(post_deadline);
-
-      if (!validDeadline) {
-        console.log(`⏭️ SKIPPING: Deadline "${post_deadline}" is expired or invalid - ${post_title}`);
-        return null; // Skip this post
-      }
-
-      let data = {
-        position: post_position,
-        study_area: post_title,
-        institution: post_Inst,
-        application_link: app_link,
-        application_deadline: post_deadline,     //rolling posts deleted at the end of the scrap year
-        postLink: `${postLink}`,
-      };
-
-      return data;
-
-    };
-
-
-    for (let i = 0; i < linksToProcess.length; i++) {
-      console.log(`\n📌 Processing post ${i + 1}/${linksToProcess.length}`);
+    for (let i = 0; i < links.length; i++) {
+      console.log(`\n📌 Processing post ${i + 1}/${links.length}`);
       try {
-        const result = await extractPostDetails(linksToProcess[i]);
+        const result = await extractPostDetails(links[i], page);
         if (result) {
           postsDetailsArr.push(result);
           console.log(`✅ Post ${i + 1} added successfully`);
@@ -290,22 +246,106 @@ async function get_jobs_ac_data () {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
+
     console.log(`\n🎉 Extraction complete!`);
     console.log(`Total posts collected: ${postsDetailsArr.length}`);
-    console.log(`Posts with future deadlines: ${postsDetailsArr.length}`);
-    console.log(postsDetailsArr);
 
-    await page.close();
-    await browser.close();
+    //console.log(postsDetailsArr)
+    //console.log(`Posts with future deadlines: ${postsDetailsArr.length}`);
+
+    let result = await storePosts(postsDetailsArr);
+    if (result && result.success && result.inserted) {console.log(`successfully stored posts ..${result.inserted}\nDetails: \n`, result)} else {console.log('No new documents available to insert at this time..', result)};
+
+
+    //allLinks.push(...links);
+
+    // Try to find the next page link
+    console.log("proceeding to find next page link..")
+      let dt =  await page.goto(currentUrl, {
+      waitUntil: "domcontentloaded",
+    });
+
+    //console.log(dt)
+    //console.log(`page: `, page)
+    const nextPageLink = await page.evaluate(() => {
+      const nextButton = document.querySelector("#results > div.j-search-content__pagination.j-search-content__pagination--center.j-search-content__results-footer > div > span > a");
+      if (nextButton && nextButton.href) {
+        return nextButton.href;
+      }
+      return null;
+    });
+
+    //console.log(nextPageLink)
+
+    if (nextPageLink && pageNum < maxPages) {
+      console.log(`🔗 Next page link found: `); //${nextPageLink}
+      currentUrl = nextPageLink;
+      pageNum++;
+
+      // Add delay between page requests
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } else {
+      console.log(`📌 No more pages or reached max pages (${maxPages})`);
+      break;
+    }
+  }
+
+  console.log(`\n📊 completed scrap and post events..`);
+  await page.close();
+  await browser.close();
+} catch (error) {
+  console.error(error)
+}
+
+
+}
+
+{/**UTILITIES eND */}
+
+async function get_jobs_ac_data () {
+
+
+
+  try {
+
+   await initializeDatabase();
+
+    const baseUrl = "https://www.jobs.ac.uk/search/?academicDisciplineFacet[0]=psychology&academicDisciplineFacet[1]=physical-and-environmental-sciences&subDisciplineFacet[0]=geography&academicDisciplineFacet[2]=mathematics-and-statistics&subDisciplineFacet[1]=mathematics&subDisciplineFacet[2]=statistics&academicDisciplineFacet[3]=computer-sciences&subDisciplineFacet[3]=computer-science&subDisciplineFacet[4]=information-systems&subDisciplineFacet[5]=artificial-intelligence&subDisciplineFacet[6]=cyber-security&academicDisciplineFacet[4]=engineering-and-technology&subDisciplineFacet[7]=other-engineering&academicDisciplineFacet[5]=architecture-building-and-planning&subDisciplineFacet[8]=urban-and-rural-planning&academicDisciplineFacet[6]=economics&academicDisciplineFacet[7]=social-sciences-and-social-care&subDisciplineFacet[9]=sociology&subDisciplineFacet[10]=social-policy&subDisciplineFacet[11]=human-and-social-geography&academicDisciplineFacet[8]=information-management-and-librarianship&subDisciplineFacet[12]=information-science&jobTypeFacet[0]=phds&expired-job-redirect=true";
+
+    // Scrape all pages (max 8 pages as requested)
+   await scrapeAllPages(baseUrl, 8);
+
+    /*if (allLinks.length > 0) {
+      console.log(`\n✅ Total links collected: ${allLinks.length}`);
+    } else {
+      console.log('❌ No data to scrape');
+      return;
+    }*/
+
+    // Optional: Limit for testing
+    //const linksToProcess = allLinks.slice(34, 44); // Process first 10 links
+    //allLinks = allLinks.slice(0, 4);
+    //const linksToProcess = allLinks;
+    //console.log(`📌 Processing first ${linksToProcess.length} links for testing`);
+
+
+
+
+
+
+    await closeDatabase();
+    //await page.close();
+    //await browser.close();
     console.log('returning to outer cron scope?...')
     return;
 
 
   } catch (error) {
     console.error(error);
+    process.exit(1);
   }
 }
 
-//console.profile();
-get_jobs_ac_data();
-//module.exports = {scrapJobs}
+
+//get_jobs_ac_data();
+module.exports = {get_jobs_ac_data}

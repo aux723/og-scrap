@@ -5,6 +5,8 @@ const AdblockerPlugin = require('puppeteer-extra-plugin-adblocker');
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 const UserAgent = require("user-agents");
 const { formatDateForDB } = require('../../utils/dateHelpers.js');
+const { storePosts, initializeDatabase,
+    closeDatabase } = require('./predoc-db.js');
 
 function parseDeadline(deadlineText) {
     const rollingKeywords = ['rolling', 'rolling basis', 'accepted on a rolling basis', 'considered on a rolling basis', 'first review'];
@@ -141,111 +143,130 @@ async function scrap_predoc() {
         });
 
         let filteredPosts = filterFutureDeadlines(cleanedData);
-
+        //filteredPosts = filteredPosts.slice(0, 10);
+        console.log('completed deadline filter...');
         console.log(`\n=== Original posts: ${cleanedData.length} ===`);
         console.log(`=== Valid future posts: ${filteredPosts.length} ===\n`);
 
-        /*function telegram () {
+        async function telegram () {
 
-        let finalPosts = filteredPosts.map((post, index) => {
-            let postLink = post.link;
-            post = post.textLines
-            let deadline_index = post.findIndex(item => item.includes('Deadline:'));
-            let post_deadline = post[deadline_index];
-            let post_heading = post[0];
-            //post.splice(deadline_index, 1);
-            //post.splice(0, 1);
-            post = post.filter(item => item.includes(':'));
-            let visa_index = post.findIndex(item => item.includes('Visa:'));
-            if (visa_index!==-1) {
-              post[visa_index] = 'Visa sponsorship available'
-            };
+            let finalPosts = filteredPosts.map((post, index) => {
+                //console.log(post)
+                let post_copy = [...post.textLines]; let post_copy2 = [...post_copy];
+                let postLink = post.link;
+                let post_m = post.textLines;
+                let deadline_index = post.textLines.findIndex(item => item.includes('Deadline'));
 
-            let dlIndex = post.findIndex(item => item.includes('Deadline:'));
-            if (dlIndex!==-1) {
-                post[dlIndex] = '';
-              };
-
-            post = post.map(x => '🔰 ' + x);
-            post = 'HIRING: ' + post_heading + '\n\n' + post.join('\n') + '\n\n' + post_deadline + '\n' + postLink
-           //let post_body = post.splice(1, post.length-1);
-            //console.log(post)
-            //add insertion date
-              return { title: post_heading, body:post, link: postLink, deadline: post_deadline, source: 'predoc-web', target: 'telegram', insertionDate: formatDateForDB() };
-
-          //return { ...post, tag: 'from: predoc-web' };
-      });
-
-      finalPosts = finalPosts.slice(0, 6);
-      console.log(finalPosts);
-      };*/
+                // Guard clause: skip posts without deadline
+                if (deadline_index === -1) {
+                    console.log(`Skipping post without deadline: ${post_m[0] || 'Unknown title'}`);
+                    return null; // Will be filtered out later
+                }
 
 
-      function twitter() {
-        let finalPosts = filteredPosts.map((postObj) => {
-            let postLink = postObj.link;
-            // Use a copy to avoid mutating the original data structure
-            let lines = [...postObj.textLines];
+                let post_deadline = post_copy[deadline_index].split(":")[1].trim();
 
-            let deadline_index = lines.findIndex(item => item.includes('Deadline:'));
-            let post_deadline = deadline_index !== -1 ? lines[deadline_index] : 'Rolling';
-            let post_heading = lines[0];
+                let post_heading = post_m[0];
+                let visa_index = post_m.findIndex(item => item.includes('Visa:'));
+                if (visa_index !== -1) {
+                    post_m[visa_index] = 'Visa sponsorship available'
+                };
 
-            let twitterDisplayLines = [];
+                post_m = post_m.filter(item => !item.includes('Deadline'));
+                post_m = post_m.map(x => '🔰 ' + x);
+                post_m = [...post_m.slice(1, 2), ...post_m.slice(2)];
 
-            // 1. Handle Sponsoring Researcher
-            let resIdx = lines.findIndex(item => item && item.includes('Sponsoring Researcher'));
-            if (resIdx !== -1 && lines[resIdx]) {
-                let val = lines[resIdx].split(':')[1] || "";
+                post_m = post_m.map((post, index)=>{
+                    if(index===0) {
+                        return post.split("🔰 ")[1]
+                    } else {
+                        return post
+                    }
+                });
 
-                // Logic: Split by comma OR the word 'and', then take the first result
-                let firstResearcher = val.split(/,| and /i)[0].trim();
+                //console.log(post_m)
+                post_m = post_m.filter(post=>{
+                    if(post.includes(":")) {
+                        return post
+                    }
+                })
 
-                twitterDisplayLines.push('Sponsor: ' + firstResearcher);
+                post_m = post_m.filter((post, index)=>{
+                    if(post.includes("Fields of Research:") || post.includes("Field(s) of Research:")) {
+                        let split_field = post.split(":");
+                        if(split_field[1].length>1 && /[a-zA-Z]/i.test(split_field) === true ) {
+                            return post
+                        }
+                    } else {
+                        return post
+                    }
+                })
+
+               let post_b = post_m.map((post, index)=>{
+                    if(index!==0) {
+                        let split_txt = post.split(":");
+                        //console.log(split_txt)
+                        let j1 = `<b>${split_txt[0]}</b>`; let j2 = split_txt[1];
+                        return j1 + ":"+ " "+j2;
+                    } else {
+                        return post
+                    }
+                })
+                //console.log(post_m)
+
+                post_b = `<b>${post_heading}</b>\n\n` + post_b.join('\n\n');
+
+                //console.log(post_b)
+
+                return {
+                    post_title: post_heading,
+                    body: post_b,
+                    post_data_main: post_copy2,
+                    app_link: postLink,
+                    deadline: post_deadline,
+                    insertionDate: formatDateForDB()
+                };
+            }).filter(post => post !== null); // Remove null entries
+
+
+      /* finalPosts = finalPosts.filter((post, index)=>{
+        if(post.body && post.body.includes("Fields of Research:") || post.body && post.body.includes("Field(s) of Research:")) {
+            let p_body_arr = post.body.split("\n");
+            let split_field = p_body_arr[fields_index]; split_field = split_field.split(":");
+            if(split_field[1].length>1 && /[a-zA-Z]/i.test(split_field) === true ) {
+                return post
             }
 
-            // 2. Handle Sponsoring Institution
-            let instIdx = lines.findIndex(item => item && item.includes('Sponsoring Institution'));
-            if (instIdx !== -1 && lines[instIdx]) {
-                let instVal = lines[instIdx].split(':')[1] || "";
-                twitterDisplayLines.push('Institution: ' + instVal.trim());
-            }
+        }
+      }) */
 
-            // 3. Clean up the heading
-            if (post_heading && post_heading.includes('Pre-Doctoral Research Fellow')) {
-                post_heading = 'Pre-Doctoral Research Fellow';
-            }
+      return finalPosts
+      //console.log(finalPosts); //add to db
 
-            // 4. Final Formatting
-            let formattedBody = twitterDisplayLines.map(x => '🔰 ' + x);
-            let fullBodyText = 'HIRING: ' + post_heading + '\n\n' +
-                               formattedBody.join('\n') + '\n\n' +
-                               post_deadline + '\n' + postLink;
 
-            return {
-                title: post_heading,
-                body: fullBodyText,
-                link: postLink,
-                deadline: post_deadline,
-                source: 'predoc-web',
-                target: 'twitter',
-                insertionDate: formatDateForDB()
-            };
-        });
+      };
 
-        // Output a small sample to verify
-        console.log(finalPosts.slice(15, 28));
-    }
+      let posts = await telegram(); //console.log(posts)
 
-            twitter();
-            await page.close();
-            await browser.close();
-            console.log('returning to outer cron scope?...')
-            return;
+  try {
+        await initializeDatabase();
+        let result = await storePosts(posts);
+        if (result && result.success && result.inserted > 0) {console.log(`successfully stored ${result.inserted} posts ..\nDetails: `, result)} else {console.log(`No new documents available to insert at this time..`, result)};
+        await closeDatabase();
+      } catch (error) {
+        await closeDatabase();
+        console.error(error);
+      }
+
+    await page.close();
+    await browser.close();
+    console.log('returning to outer cron scope?...')
+    return;
 
     } catch (error) {
-        console.error("Scraping failed:", error);
+        console.error("Scraping failed:", error); process.exit(1);
     }
 }
 
-scrap_predoc();
+//scrap_predoc();
+module.exports = {scrap_predoc};

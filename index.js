@@ -1,9 +1,7 @@
 const cron = require("node-cron");
 
-
-// Import the optimized database and AI functions
-const {makePost} = require("./poster/poster.js"); //poster
-const { scrapJobs } = require("./scraper/scraper.js"); //scraper
+const {scrap_predoc} = require("./scrapers/predoc/predoc-main.js")
+const {get_jobs_ac_data} = require("./scrapers/jobs-ac/jobs-ac-main.js")
 const { getNigerianTime, formatNigerianTime } = require("./utils/dateHelpers.js");
 
 // --- Core Application Logic ---
@@ -38,57 +36,28 @@ const server = http.createServer((req, res) => {
 
 // --- Cron Jobs Setup ---
 async function setupCronJobs() {
-  // 4:00 AM - Early morning scraping job
+  // 4:00 AM - First scrap of the day
   cron.schedule('0 4 * * *', async () => {
-    console.log('🌅 4:00 AM - Scraping new jobs - executing scrapJobs()');
-    await scrapJobs();
+    console.log('🌅 3:00 AM - Scraping new jobs - predoc..');
+    await scrap_predoc(); process.exit(1);
   }, {
     scheduled: true,
     timezone: "Africa/Lagos"
   });
 
-  // 10:00 AM - First posting of the day
+  //// 10:00 AM - Second scrap of the day
   cron.schedule('0 10 * * *', async () => {
-    console.log('🌞 10:00 AM - Morning post - executing makePost()');
-    await makePost();
-  }, {
-    scheduled: true,
-    timezone: "Africa/Lagos"
-  });
-
-  // 12:00 PM - Second posting
-  cron.schedule('0 12 * * *', async () => {
-    console.log('☀️ 12:00 PM - Noon post - executing makePost()');
-    await makePost();
-  }, {
-    scheduled: true,
-    timezone: "Africa/Lagos"
-  });
-
-  // 3:00 PM - Third posting
-  cron.schedule('0 15 * * *', async () => {
-    console.log('🌤️ 3:00 PM - Afternoon post - executing makePost()');
-    await makePost();
-  }, {
-    scheduled: true,
-    timezone: "Africa/Lagos"
-  });
-
-  // 7:00 PM - Final posting of the day
-  cron.schedule('0 19 * * *', async () => {
-    console.log('🌙 7:00 PM - Evening post - executing makePost()');
-    await makePost();
+    console.log('🌅 10:00 AM - Scraping new jobs - jbs-ac..');
+    await get_jobs_ac_data(); process.exit(1);
   }, {
     scheduled: true,
     timezone: "Africa/Lagos"
   });
 
   console.log('📅 Daily Schedule:');
-  console.log('   - 4:00 AM: Scraping new jobs');
-  console.log('   - 10:00 AM: First post');
-  console.log('   - 12:00 PM: Second post');
-  console.log('   - 3:00 PM: Third post');
-  console.log('   - 7:00 PM: Final post');
+  console.log('   - 4:00 AM: First scrap');
+  console.log('   - 10:00 AM: Second scrap');
+
 }
 
 // --- Server Startup and Graceful Shutdown ---

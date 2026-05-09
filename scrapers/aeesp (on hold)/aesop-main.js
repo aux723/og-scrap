@@ -6,9 +6,11 @@ puppeteer.use(StealthPlugin());
 const AdblockerPlugin = require('puppeteer-extra-plugin-adblocker')
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }))
 const UserAgent = require("user-agents");
+const { formatDateForDB } = require('../../utils/dateHelpers.js');
 //const {extractContactInfo} = require ('../../utils/email_link_extractor.js')
 const {extractContactInfo} = require ('./utils/aesop_email_link_extractor');
 const {extractDeadlineData} = require ('./utils/aesop_deadline_extractor');
+const { storePosts } = require('./aesop-db.js');
 /**<---------utilities------------>**/
 function clearPostDocTitle(text) {
   const patternsToRemove = [
@@ -178,7 +180,7 @@ async function scrapeJobsFromPage(page, url) {
 /**<---------utilities-end------------>**/
 
 /**<-------program-codes-------->**/
-async function scrap_predoc () {
+async function scrap_aesop () {
 
 
     let browser;
@@ -250,11 +252,8 @@ async function scrap_predoc () {
     }
 
     let filteredPosts = filterOutFaculty(allPostBlocks);
-    console.log(`Filtered posts count (after removing faculty/undergrad): ${filteredPosts.length}`);
+    console.log(`Filtered posts count (after removing headings that contain faculty or undergrad): ${filteredPosts.length}`);
 
-    filteredPosts = filteredPosts.slice(0, 10);
-    console.log(`Reduced filtered posts count (limit 10): ${filteredPosts.length}`);
-    //also scrap link "https://aeesp.org/jobs?page=1" and merge second scrap posts with filteredPosts from first scrap
     let postsDetailsArr = [];
 
 
@@ -316,13 +315,13 @@ async function scrap_predoc () {
 
       let data = {
         position: post_position,
-        study_area: post_title,
+        post_title: post_title,
         institution: post_Inst,
         contact_email: contactInfo.email,
         application_link: contactInfo.link,
         application_deadline: post_deadline,     //rolling posts deleted at the end of the scrap year
         postLink: postL,
-        scrap_date: getCurrentDate()
+        insertionDate: formatDateForDB()
       };
 
       //console.log (data);
@@ -350,11 +349,13 @@ async function scrap_predoc () {
     }
 
     console.log(`\n🎉 Extraction complete! Total posts: ${postsDetailsArr.length}`);
-    console.log("post details array: \n", postsDetailsArr);
+    console.log(postsDetailsArr)
+    /*let result = await storePosts(postsDetailsArr);
+    if (result && result.success) {console.log(`successfully stored posts ..\nDetails: \n${result}`)} else {console.log('No new documents available to insert at this time..')};
     await page.close();
     await browser.close();
     console.log('returning to outer cron scope?...')
-    return;
+    return;*/
 
 
   } catch (error) {
@@ -363,5 +364,5 @@ async function scrap_predoc () {
 }
 
 //console.profile();
-scrap_predoc();
+scrap_aesop();
 //module.exports = {scrapJobs}

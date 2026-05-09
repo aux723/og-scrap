@@ -316,7 +316,7 @@ async function scrap_predoc () {
 
       let data = {
         position: post_position,
-        study_area: post_title,
+        post_title: post_title,
         institution: post_Inst,
         contact_email: contactInfo.email,
         application_link: contactInfo.link,
