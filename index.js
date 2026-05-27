@@ -1,6 +1,6 @@
 const cron = require("node-cron");
 
-const {scrap_predoc} = require("./scrapers/predoc/predoc-main.js");
+const {base_scraper} = require("./scrapers/scholarships-future/sft-main.js");
 const {get_jobs_ac_data} = require("./scrapers/jobs-ac/jobs-ac-main.js");
 const {academy} = require("./scrapers/academy-pos/academy-main.js");
 const { getNigerianTime, formatNigerianTime } = require("./utils/dateHelpers.js");
@@ -38,7 +38,7 @@ async function setupCronJobs() {
   // 4:00 AM - First scrap of the day
   cron.schedule('0 3 * * *', async () => {
     console.log('🌅 3:00 AM - Scraping new jobs - predoc..');
-    await scrap_predoc(); process.exit(1);
+    await base_scraper(); process.exit(1);
   }, {
     scheduled: true,
     timezone: "Africa/Lagos"
