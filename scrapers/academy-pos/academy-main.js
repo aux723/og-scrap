@@ -225,6 +225,25 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
         return extractedLinks;
       });
 
+      console.log(`Found ${links.length} job links on page ${pageNum}`);
+      if (links.length === 0) {
+        // Helpful debug when the list is empty
+        const debug = await page.evaluate(() => ({
+          title: document.title,
+          url: location.href,
+          bodyText: document.body.innerText.slice(0, 500),
+          hasJobDetails: !!document.querySelector('#jobDetails'),
+          listItems: document.querySelectorAll('.list-group-item').length,
+        }));
+        console.log('DEBUG (empty links):', JSON.stringify(debug, null, 2));
+      };
+
+      const listHtml = await page.evaluate(() => {
+        const el = document.querySelector('.list-group') || document.body;
+        return el ? el.outerHTML.slice(0, 2000) : 'no list-group';
+      });
+      console.log('List HTML snippet:', listHtml);
+
       //links = links.slice(0, 10);
       let postsDetailsArr = [];
 
