@@ -126,7 +126,18 @@ async function startServer() {
     server.listen(PORT, async () => {
       console.log(`🟢 Server is live on port ${PORT}`);
       console.log(`⏰ Current Nigerian time: ${formatNigerianTime()}`);
-      console.log('attempting to run pos fn...'); await academy();
+
+      // Solution 4: Make the main academy() call safer so a scraper crash
+      // does not take down the entire HTTP server / process.
+      try {
+        console.log('attempting to run academy scraper...');
+        await academy();
+        console.log('✅ Academy scraper completed successfully');
+      } catch (err) {
+        console.error('❌ Academy scraper crashed (server stays alive):', err.message);
+        // Do NOT process.exit – keep the health-check server running
+      }
+
       //await setupCronJobs();
     });
 
@@ -162,15 +173,18 @@ async function startServer() {
   }
 }
 
-// Unhandled promise rejection handler
+// Unhandled promise rejection handler – log but do not crash the server
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Keep process alive on free tier so health checks continue to respond
 });
 
-// Uncaught exception handler
+// Uncaught exception handler – log and keep running unless it is truly fatal
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
-  process.exit(1);
+  // Only exit on truly unrecoverable errors; otherwise stay alive
+  // so Render does not keep restarting the service in a loop.
+  // process.exit(1);
 });
 
 startServer();
