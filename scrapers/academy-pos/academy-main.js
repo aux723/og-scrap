@@ -8,6 +8,61 @@ const { formatDateForDB } = require('../../utils/dateHelpers.js');
 const { storePosts, checkPostsCount, initializeDatabase,
   closeDatabase } = require('./academy-db.js');
 
+// -------------------------------------------------------
+// Free proxies from https://spys.me/proxy.txt (selected ones with Google-passed + and/or SSL)
+// These die quickly – replace often or switch to paid residential proxies for production.
+// -------------------------------------------------------
+const PROXY_LIST = [
+  "74.91.117.249:3128",      // US-H-S +
+  "108.161.135.118:80",      // US-H +
+  "143.198.135.176:80",      // US-H +
+  "96.1.101.113:80",         // CA-H +
+  "163.172.167.48:80",       // FR-H +
+  "104.129.203.85:9480",     // US-N-S +
+  "107.161.178.244:3128",    // US-H-S +
+  "137.184.76.67:3128",      // US-H +
+  "162.214.74.29:8085",      // US-H +
+  "5.8.41.106:3128",         // US-H-S +
+  "154.9.254.25:58080",      // US-H-S +
+  "64.181.247.193:443",      // US-H-S +
+  "167.99.124.118:80",       // US-A +
+  "198.111.166.184:80",      // US-H +
+  "45.125.64.215:443",       // HK-H-S +
+  "91.103.120.48:80",        // HK-H! +
+  "69.165.75.99:8080",       // HK-H-S +
+  "217.162.8.134:80",        // CH-H +
+  "207.180.254.198:8080",    // FR-H +
+  "62.210.215.36:80",        // FR-A +
+  "109.199.119.160:80",      // FR-H +
+  "34.140.137.151:80",       // BE-H +
+  "194.14.207.87:8001",      // SE-H +
+  "159.195.194.242:8080",    // DE-H-S! +
+  "104.225.220.233:80",      // US-H +
+];
+
+let currentProxyIndex = 0;
+
+function getNextProxy() {
+  if (PROXY_LIST.length === 0) return null;
+  const proxy = PROXY_LIST[currentProxyIndex % PROXY_LIST.length];
+  currentProxyIndex++;
+  return proxy;
+}
+
+function isCloudflareChallenge(page) {
+  return page.evaluate(() => {
+    const title = document.title || "";
+    const body = document.body ? document.body.innerText : "";
+    return (
+      title.includes("Just a moment") ||
+      body.includes("Performing security verification") ||
+      body.includes("This website uses a security service to protect against malicious bots") ||
+      !!document.querySelector("#cf-chl-widget") ||
+      !!document.querySelector("[name='cf-turnstile-response']")
+    );
+  });
+}
+
 function isValidDeadline(dateString) {
   // If date is unspecified, assume it's valid
   if (!dateString || dateString === 'Unspecified') return true;
@@ -16,6 +71,7 @@ function isValidDeadline(dateString) {
   const isoPattern = /^\d{4}-\d{2}-\d{2}/;
   if (!isoPattern.test(dateString)) return true; // Keep if not ISO format
 
+  // No need to split - dateString is already just "YYYY-MM-DD"
   const date = new Date(dateString);
 
   // Check if date is valid
@@ -94,29 +150,15 @@ async function extractPostDetails (postLink, page) {
       waitUntil: "domcontentloaded",
     });
 
-    // Cloudflare check & bypass validation
-    await page.waitForFunction(() => {
-      return !document.title.includes('Just a moment') &&
-             !document.body.innerText.includes('security verification');
-    }, { timeout: 45000 }).catch(() => {
-      console.log('⚠️ Still on Cloudflare challenge after 45s');
-    });
-
-    const isChallenge = await page.evaluate(() =>
-      document.title.includes('Just a moment') ||
-      document.body.innerText.includes('Performing security verification')
-    );
-
-    if (isChallenge) {
-      console.log('🚫 Cloudflare challenge detected – aborting this post page');
+    // Quick Cloudflare check on detail pages too
+    if (await isCloudflareChallenge(page)) {
+      console.log("🚫 Cloudflare challenge on detail page – skipping this post");
       return null;
-    } else {
-      console.log('✅ Cloudflare detection bypassed successfully on post page');
     }
 
     await page.waitForSelector("#jobDetails", {
       visible: true,
-      timeout: 0,
+      timeout: 15000,
     });
 
     let post_title = await page.evaluate(() => {
@@ -135,61 +177,139 @@ async function extractPostDetails (postLink, page) {
       return element ? element.textContent : null;
     });
 
+    //post_Inst = trimInst(post_Inst);
+
     let app_link = await page.evaluate(() => {
-      const element = document.querySelector('#gtm-job-ad-apply-now-bottom-section');
+      const element = document.querySelector('#gtm-job-ad-apply-now-bottom-section'); //if link == apply; app_Link = Post_Link
       return element ? element.href : null;
     });
 
     let post_deadline = await page.evaluate(() => {
       const element = document.querySelector('#jobDetails > div > div:nth-child(5) > div.col-auto.col-md-8');
       return element ? element.textContent : null;
-    });
+    }); //deadline format: 2026-06-14 || Unspecified
 
 
     let data = {
-      post_title: post_title ? post_title.trim() : 'Unspecified',
-      institution: post_Inst ? post_Inst.trim() : 'Unspecified',
-      field: field ? field.trim() : 'Unspecified',
+      post_title: post_title.trim(),
+      institution: post_Inst.trim(),
+      field: field.trim(),
       application_link: app_link,
-      application_deadline: post_deadline ? post_deadline.trim() : 'Unspecified',
+      application_deadline: post_deadline.trim(),     //rolling posts deleted at the end of the scrap year (db code using the extracted year to delete post from db)
       postLink: `${postLink}`,
       insertionDate: formatDateForDB()
     };
 
     return data;
   } catch (error) {
-    console.error('Error in extractPostDetails:', error.message);
+    console.error(error.message)
     return null;
   }
+
 };
 
 
-async function scrapeAllPages (startUrl, maxPages = 10) {
-  let browser;
-  browser = await puppeteer.launch({
+async function launchBrowserWithProxy(proxy = null) {
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--disable-gpu',
+    '--disable-web-security',
+    '--disable-features=VizDisplayCompositor',
+    '--single-process',
+  ];
+
+  if (proxy) {
+    args.push(`--proxy-server=http://${proxy}`);
+    console.log(`🌐 Using proxy: ${proxy}`);
+  } else {
+    console.log(`🌐 No proxy (direct connection)`);
+  }
+
+  const browser = await puppeteer.launch({
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--disable-web-security',
-      '--disable-features=VizDisplayCompositor',
-      '--single-process',
-    ],
+    args,
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
   });
 
-  let page;
+  return browser;
+}
 
-  try {
+
+async function scrapeAllPages (startUrl, maxPages = 10) {
+
+  let browser;
+  let page;
+  let proxyAttempts = 0;
+  const maxProxyAttempts = PROXY_LIST.length; // try all proxies once if needed
+
+  // Helper to (re)start browser + page with a new proxy when Cloudflare blocks us
+  async function getWorkingPage(currentUrl) {
+    while (proxyAttempts < maxProxyAttempts) {
+      const proxy = getNextProxy();
+      proxyAttempts++;
+
+      try {
+        if (browser) {
+          await browser.close().catch(() => {});
+        }
+
+        browser = await launchBrowserWithProxy(proxy);
+        page = await browser.newPage();
+        page.setDefaultNavigationTimeout(0);
+
+        // Block images, stylesheets, and fonts
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+          if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+            req.abort();
+          } else {
+            req.continue();
+          }
+        });
+
+        let userAgent = new UserAgent({ deviceCategory: "mobile" });
+        let randomAgent = userAgent.toString();
+        await page.setUserAgent(randomAgent);
+
+        console.log(`📄 Navigating to: ${currentUrl}`);
+        await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+        // Wait a bit for possible Cloudflare JS challenge
+        await new Promise(r => setTimeout(r, 4000));
+
+        const challenged = await isCloudflareChallenge(page);
+        if (challenged) {
+          console.log(`🚫 Cloudflare challenge detected with proxy ${proxy} – trying next...`);
+          continue; // try next proxy
+        }
+
+        // Extra safety: wait for real content
+        try {
+          await page.waitForSelector("h2", { visible: true, timeout: 15000 });
+        } catch (e) {
+          console.log(`⚠️ h2 selector not found – possible soft block. Trying next proxy.`);
+          continue;
+        }
+
+        console.log(`✅ Proxy ${proxy} appears to work (no Cloudflare challenge)`);
+        return page; // success
+      } catch (err) {
+        console.error(`❌ Failed with proxy ${proxy}: ${err.message}`);
+        continue;
+      }
+    }
+
+    // Last resort – try without any proxy
+    console.log("⚠️ All proxies failed or exhausted. Trying direct connection...");
+    if (browser) await browser.close().catch(() => {});
+    browser = await launchBrowserWithProxy(null);
     page = await browser.newPage();
     page.setDefaultNavigationTimeout(0);
-
-    // Block images, stylesheets, and fonts to save memory and bandwidth
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -198,50 +318,33 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
         req.continue();
       }
     });
-
     let userAgent = new UserAgent({ deviceCategory: "mobile" });
-    let randomAgent = userAgent.toString();
-    await page.setUserAgent(randomAgent);
+    await page.setUserAgent(userAgent.toString());
+    await page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    return page;
+  }
 
+
+  try {
     let currentUrl = startUrl;
-    let nextPageLink;
-    let stockLink = "https://academicpositions.com/jobs/position/phd?page=";
     let pageNum = 1;
+    const stockLink = "https://academicpositions.com/jobs/position/phd?page=";
 
     while (pageNum <= maxPages) {
-      console.log(`\n📄 Scraping page ${pageNum}: `);
+      console.log(`\n📄 Scraping page ${pageNum}`);
 
-      // Navigate to the current page
-      await page.goto(currentUrl, {
-        waitUntil: "domcontentloaded",
-      });
+      page = await getWorkingPage(currentUrl);
 
-      // Cloudflare check & bypass validation for listing page
-      await page.waitForFunction(() => {
-        return !document.title.includes('Just a moment') &&
-               !document.body.innerText.includes('security verification');
-      }, { timeout: 45000 }).catch(() => {
-        console.log('⚠️ Still on Cloudflare challenge after 45s');
-      });
-
-      const isChallenge = await page.evaluate(() =>
-        document.title.includes('Just a moment') ||
-        document.body.innerText.includes('Performing security verification')
-      );
-
-      if (isChallenge) {
-        console.log('🚫 Cloudflare challenge detected – skipping this listing page');
-        pageNum++;
-        currentUrl = stockLink + `${pageNum}`;
-        continue;
-      } else {
-        console.log('✅ Cloudflare detection bypassed successfully on listing page');
+      // Final Cloudflare check
+      if (await isCloudflareChallenge(page)) {
+        console.log("🚫 Still blocked by Cloudflare after all attempts. Aborting.");
+        break;
       }
 
       await page.waitForSelector("h2", {
         visible: true,
-        timeout: 0,
-      });
+        timeout: 20000,
+      }).catch(() => console.log("h2 wait timed out"));
 
       let links = await page.evaluate(() => {
         let jobListingElements = document.querySelectorAll(".list-group-item.text-reset.text-decoration-none > a");
@@ -257,6 +360,7 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
       });
 
       console.log(`Found ${links.length} job links on page ${pageNum}`);
+
       if (links.length === 0) {
         const debug = await page.evaluate(() => ({
           title: document.title,
@@ -266,7 +370,7 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
           listItems: document.querySelectorAll('.list-group-item').length,
         }));
         console.log('DEBUG (empty links):', JSON.stringify(debug, null, 2));
-      };
+      }
 
       let postsDetailsArr = [];
 
@@ -278,27 +382,28 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
             postsDetailsArr.push(result);
             console.log(`✅ Post ${i + 1} added successfully`);
           } else {
-            console.log(`⏭️ Post ${i + 1} skipped (blocked or expired)`);
+            console.log(`⏭️ Post ${i + 1} skipped`);
           }
         } catch (err) {
           console.error(`❌ Failed to extract post ${i + 1}:`, err.message);
         }
 
         // Wait between requests
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 1200));
       };
 
-      console.log(`\n🎉 Extraction complete for page ${pageNum}!`);
+      console.log(`\n🎉 Extraction complete!`);
       console.log(`Total posts collected: ${postsDetailsArr.length}`);
       postsDetailsArr = cleanJobData(postsDetailsArr);
       postsDetailsArr = filterExpiredDeadlines(postsDetailsArr);
       postsDetailsArr = postsDetailsArr.filter(p => {
-        if(p.application_deadline != "Unspecified") {
+        if (p.application_deadline != "Unspecified") {
           return p;
         }
       });
 
       console.log(`✅ Total valid posts after filtering: ${postsDetailsArr.length}`);
+
       await checkPostsCount();
       let result = await storePosts(postsDetailsArr);
       if (result && result.success && result.inserted) {
@@ -309,40 +414,50 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
 
       if (pageNum < maxPages) {
         pageNum++;
-        nextPageLink = stockLink + `${pageNum}`;
-        console.log(`🔗 Next page link prepared:\n `, nextPageLink);
+        const nextPageLink = stockLink + `${pageNum}`;
+        console.log(`🔗 Next page link: ${nextPageLink}`);
         currentUrl = nextPageLink;
 
-        // Add delay between page requests
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Small delay between pages
+        await new Promise(resolve => setTimeout(resolve, 2500));
       } else {
-        console.log(`📌 No more pages or reached max pages (${maxPages})`);
+        console.log(`📌 Reached max pages (${maxPages})`);
         break;
       }
-    };
+    }
 
-    await page.close();
-    await browser.close();
+    if (page) await page.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
     return;
 
   } catch (error) {
-    console.error('Error in scrapeAllPages:', error);
+    console.error(error);
+    if (browser) await browser.close().catch(() => {});
   }
 };
 
 
 async function academy () {
+
   try {
     await initializeDatabase();
+
     const baseUrl = "https://academicpositions.com/jobs/position/phd?page=";
-    await scrapeAllPages(baseUrl, 2);
+
+    // Start with page 1
+    await scrapeAllPages(baseUrl + "1", 2);
+
     await closeDatabase();
-    console.log('returning to outer cron scope?...');
+    console.log('returning to outer cron scope?...')
     return;
+
   } catch (error) {
     console.error(error);
     process.exit(1);
   }
 }
 
-module.exports = { academy };
+
+//console.profile();
+//(async ()=> await academy())();
+module.exports = { academy }
