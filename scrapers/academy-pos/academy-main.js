@@ -9,48 +9,87 @@ const { storePosts, checkPostsCount, initializeDatabase,
   closeDatabase } = require('./academy-db.js');
 
 // -------------------------------------------------------
-// Free proxies – known-good ones first.
-// Free public proxies die fast; prefer the one that already worked.
+// Dynamic proxy loading from https://spys.me/proxy.txt
+// Prefer Google-passed (+) and SSL (S) entries, keep list small.
 // -------------------------------------------------------
-const PROXY_LIST = [
-  "104.129.203.85:9480",     // known working from previous run
-  "74.91.117.249:3128",
-  "108.161.135.118:80",
-  "143.198.135.176:80",
-  "96.1.101.113:80",
-  "163.172.167.48:80",
-  "107.161.178.244:3128",
-  "137.184.76.67:3128",
-  "162.214.74.29:8085",
-  "5.8.41.106:3128",
-  "154.9.254.25:58080",
-  "64.181.247.193:443",
-  "167.99.124.118:80",
-  "198.111.166.184:80",
-  "45.125.64.215:443",
-  "91.103.120.48:80",
-  "69.165.75.99:8080",
-  "217.162.8.134:80",
-  "207.180.254.198:8080",
-  "62.210.215.36:80",
-  "109.199.119.160:80",
-  "34.140.137.151:80",
-  "194.14.207.87:8001",
-  "159.195.194.242:8080",
-  "104.225.220.233:80",
-];
+const PROXY_SOURCE_URL = "https://spys.me/proxy.txt";
+const MAX_PROXIES_TO_KEEP = 25;          // hard cap – never hold hundreds in memory
+const MAX_PROXY_ATTEMPTS = 8;            // max tries per browser creation
+const BROWSER_RESTART_EVERY = 6;         // restart Chromium every N detail pages
+const LINKS_PER_PAGE = 20;               // max job links to process per listing page
 
-let lastWorkingProxy = "104.129.203.85:9480"; // remember what worked
+// Persists for the lifetime of the process (survives page-1 → page-2)
+let lastWorkingProxy = null;
+let proxyList = [];                      // filled dynamically at start of each run
 let currentProxyIndex = 0;
 
-// Restart browser every N detail pages to keep memory low on free tier
-const BROWSER_RESTART_EVERY = 6;
-// Max proxy attempts per browser creation (keeps free-tier from spawning too many Chromiums)
-const MAX_PROXY_ATTEMPTS = 8;
+/**
+ * Fetch + parse https://spys.me/proxy.txt
+ * Prefer lines that have Google-passed (+) and/or SSL (S).
+ * Returns a small array of "ip:port" strings.
+ */
+async function fetchFreshProxies() {
+  console.log(`📡 Fetching fresh proxies from ${PROXY_SOURCE_URL} ...`);
+  try {
+    const res = await fetch(PROXY_SOURCE_URL, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; proxy-fetcher/1.0)" }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const scored = [];
+
+    for (const line of lines) {
+      // Format: 45.125.64.215:443 HK-H-S +
+      const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})\s+(\S+)/);
+      if (!m) continue;
+
+      const hostPort = m[1];
+      const meta = m[2] || "";
+      // Score: prefer Google-passed (+), SSL (S), High anonymity (H)
+      let score = 0;
+      if (line.includes("+")) score += 3;          // Google passed
+      if (meta.includes("S") || line.includes("-S")) score += 2; // SSL
+      if (meta.includes("H") || line.includes("-H")) score += 1; // High anon
+      if (meta.includes("A") || line.includes("-A")) score += 1; // Anonymous
+
+      scored.push({ hostPort, score });
+    }
+
+    // Sort best first, take only MAX_PROXIES_TO_KEEP
+    scored.sort((a, b) => b.score - a.score);
+    const selected = scored.slice(0, MAX_PROXIES_TO_KEEP).map(p => p.hostPort);
+
+    // If we already have a lastWorkingProxy, put it at the front
+    if (lastWorkingProxy && !selected.includes(lastWorkingProxy)) {
+      selected.unshift(lastWorkingProxy);
+    } else if (lastWorkingProxy) {
+      // move it to front
+      const idx = selected.indexOf(lastWorkingProxy);
+      if (idx > 0) {
+        selected.splice(idx, 1);
+        selected.unshift(lastWorkingProxy);
+      }
+    }
+
+    console.log(`✅ Loaded ${selected.length} proxies (top-scored from source)`);
+    return selected;
+  } catch (err) {
+    console.error(`⚠️ Failed to fetch proxies: ${err.message}`);
+    // Fallback to whatever we still have in memory (lastWorkingProxy only)
+    if (lastWorkingProxy) {
+      console.log(`🔁 Falling back to last known good proxy: ${lastWorkingProxy}`);
+      return [lastWorkingProxy];
+    }
+    return [];
+  }
+}
 
 function getNextProxy() {
-  if (PROXY_LIST.length === 0) return null;
-  const proxy = PROXY_LIST[currentProxyIndex % PROXY_LIST.length];
+  if (proxyList.length === 0) return null;
+  const proxy = proxyList[currentProxyIndex % proxyList.length];
   currentProxyIndex++;
   return proxy;
 }
@@ -207,7 +246,6 @@ async function launchBrowserWithProxy(proxy = null) {
     '--disable-gpu',
     '--disable-web-security',
     '--disable-features=VizDisplayCompositor',
-    // Removed --single-process – it makes Chromium less stable under proxy failures
     '--js-flags=--max-old-space-size=384',
   ];
 
@@ -231,7 +269,7 @@ async function launchBrowserWithProxy(proxy = null) {
 
 /**
  * Try a single proxy (or direct). Returns {browser, page, proxy} or null on failure.
- * Never throws – caller decides what to do.
+ * Never throws.
  */
 async function tryOneProxy(targetUrl, proxy) {
   let browser = null;
@@ -257,7 +295,6 @@ async function tryOneProxy(targetUrl, proxy) {
     console.log(`📄 Navigating to: ${targetUrl}`);
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // Short wait for possible Cloudflare JS
     await new Promise(r => setTimeout(r, 3500));
 
     if (await isCloudflareChallenge(page)) {
@@ -290,11 +327,9 @@ async function tryOneProxy(targetUrl, proxy) {
 
 /**
  * Creates a working browser+page.
- * Strategy:
- *  1. Try lastWorkingProxy first (fast path)
- *  2. Then try up to MAX_PROXY_ATTEMPTS other proxies
- *  3. Finally try direct connection
- * Adds a small delay between attempts to avoid hammering the free tier.
+ * 1. lastWorkingProxy first
+ * 2. up to MAX_PROXY_ATTEMPTS from the freshly fetched list
+ * 3. direct connection as last resort
  */
 async function createWorkingBrowserAndPage(targetUrl) {
   // 1. Prefer the last proxy that actually worked
@@ -305,15 +340,13 @@ async function createWorkingBrowserAndPage(targetUrl) {
       lastWorkingProxy = result.proxy;
       return result;
     }
-    // small cooldown after failure
     await new Promise(r => setTimeout(r, 2000));
   }
 
-  // 2. Try a limited number of other proxies
+  // 2. Try a limited number of other proxies from the dynamic list
   let attempts = 0;
-  while (attempts < MAX_PROXY_ATTEMPTS) {
+  while (attempts < MAX_PROXY_ATTEMPTS && proxyList.length > 0) {
     const proxy = getNextProxy();
-    // skip if it is the same as lastWorkingProxy (already tried)
     if (proxy === lastWorkingProxy) {
       attempts++;
       continue;
@@ -322,11 +355,16 @@ async function createWorkingBrowserAndPage(targetUrl) {
     const result = await tryOneProxy(targetUrl, proxy);
     if (result) {
       lastWorkingProxy = result.proxy;
+      // Promote this working proxy to the front of the in-memory list
+      const idx = proxyList.indexOf(result.proxy);
+      if (idx > 0) {
+        proxyList.splice(idx, 1);
+        proxyList.unshift(result.proxy);
+      }
       return result;
     }
 
     attempts++;
-    // cooldown between launches – critical on free tier
     await new Promise(r => setTimeout(r, 2500));
   }
 
@@ -384,10 +422,10 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
         return extractedLinks;
       }).catch(() => []);
 
-      // Limit to 20 links per page to reduce memory / runtime pressure on free tier
-      if (links.length > 20) {
-        console.log(`Found ${links.length} job links – limiting to first 20`);
-        links = links.slice(0, 20);
+      // Limit links per page
+      if (links.length > LINKS_PER_PAGE) {
+        console.log(`Found ${links.length} job links – limiting to first ${LINKS_PER_PAGE}`);
+        links = links.slice(0, LINKS_PER_PAGE);
       } else {
         console.log(`Found ${links.length} job links on page ${pageNum}`);
       }
@@ -422,7 +460,6 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
             console.log("🗑️ Forced garbage collection");
           }
 
-          // Important: give the OS a moment to reclaim memory before launching again
           await new Promise(r => setTimeout(r, 3000));
 
           try {
@@ -448,7 +485,6 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
         } catch (err) {
           console.error(`❌ Unexpected error on post ${i + 1}: ${err.message}`);
 
-          // Try to recover the page
           try {
             if (page) await page.close().catch(() => {});
             page = await browser.newPage();
@@ -466,7 +502,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
             console.log("🔄 Recreated page after error");
           } catch (recoverErr) {
             console.error(`Could not recover page: ${recoverErr.message}`);
-            postsSinceRestart = BROWSER_RESTART_EVERY; // force full restart next time
+            postsSinceRestart = BROWSER_RESTART_EVERY;
           }
         }
 
@@ -509,7 +545,6 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
 
       if (global.gc) global.gc();
 
-      // Extra pause between listing pages – reduces chance of Render kill
       await new Promise(r => setTimeout(r, 4000));
 
       if (pageNum < maxPages) {
@@ -537,6 +572,15 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
 
 async function academy() {
   try {
+    // 1. Dynamically fetch + score proxies on every run
+    proxyList = await fetchFreshProxies();
+    currentProxyIndex = 0;
+
+    // Keep only a tiny list in memory
+    if (proxyList.length > MAX_PROXIES_TO_KEEP) {
+      proxyList = proxyList.slice(0, MAX_PROXIES_TO_KEEP);
+    }
+
     await initializeDatabase();
 
     const baseUrl = "https://academicpositions.com/jobs/position/phd?page=";
