@@ -384,7 +384,13 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
         return extractedLinks;
       }).catch(() => []);
 
-      console.log(`Found ${links.length} job links on page ${pageNum}`);
+      // Limit to 20 links per page to reduce memory / runtime pressure on free tier
+      if (links.length > 20) {
+        console.log(`Found ${links.length} job links – limiting to first 20`);
+        links = links.slice(0, 20);
+      } else {
+        console.log(`Found ${links.length} job links on page ${pageNum}`);
+      }
 
       if (links.length === 0) {
         const debug = await page.evaluate(() => ({
