@@ -11,7 +11,7 @@ let client = new MongoClient(uri, {
   maxPoolSize: 10,
   minPoolSize: 2,
   maxIdleTimeMS: 30000,
-  serverSelectionTimeoutMS: 5000,
+  serverSelectionTimeoutMS: 45000,
   socketTimeoutMS: 45000,
 });
 
