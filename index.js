@@ -35,7 +35,10 @@ const server = http.createServer((req, res) => {
   }
 });
 
-async function runWithLock(fn, label) {
+console.log('attempting to run pos fn...')
+(async ()=> await academy())();
+
+/*async function runWithLock(fn, label) {
   if (isJobRunning) {
       console.log(`⚠️ Skipping ${label} — another job is still running.`);
       return;
@@ -114,7 +117,7 @@ async function setupCronJobs() {
   console.log('   - 8:00 AM: Second scrap');
   console.log('   - 2:00 PM: Third scrap');
   console.log('   - 10:00 PM: Fourth scrap');
-}
+}*/
 
 // --- Server Startup and Graceful Shutdown ---
 async function startServer() {

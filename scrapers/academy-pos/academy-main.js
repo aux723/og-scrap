@@ -310,7 +310,7 @@ async function academy () {
 
     const baseUrl = "https://academicpositions.com/jobs/position/phd?page=";
 
-    await scrapeAllPages(baseUrl, 4);
+    await scrapeAllPages(baseUrl, 2);
 
     await closeDatabase();
     console.log('returning to outer cron scope?...')
@@ -325,5 +325,5 @@ async function academy () {
 
 
 //console.profile();
-(async ()=> await academy())();
-//module.exports = {academy}
+//(async ()=> await academy())();
+module.exports = {academy}
