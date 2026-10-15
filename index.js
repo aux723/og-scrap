@@ -35,8 +35,8 @@ const server = http.createServer((req, res) => {
   }
 });
 
-console.log('attempting to run pos fn...')
-(async ()=> await academy())();
+
+(async ()=> {console.log('attempting to run pos fn...'); await academy()})();
 
 /*async function runWithLock(fn, label) {
   if (isJobRunning) {
