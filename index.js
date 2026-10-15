@@ -78,18 +78,19 @@ async function setupCronJobs() {
   });
 
   //// 10:00 AM - Second scrap of the day
-  cron.schedule('0 10 * * *', async () => {
-    console.log('🌅 10:00 AM - Jobs-ac scrapper running..');
-    await runWithLock(get_jobs_ac_data, 'get_jobs_ac_data');
+  cron.schedule('0 11 * * *', async () => {
+    console.log('🌅 11:00 AM - academicpositions.com scraper running..');
+    await runWithLock(academy, 'academy');
     process.exit(1);
+
   }, {
     scheduled: true,
     timezone: "Africa/Lagos"
   });
 
   cron.schedule('0 14 * * *', async () => {
-    console.log('🌅 2:00 PM - academy scraper running..');
-    await runWithLock(academy, 'academy');
+    console.log('🌅 2:00 PM - predoc scrapper running..');
+    await runWithLock(scrap_predoc, 'scrap_predoc');
     process.exit(1);
   }, {
     scheduled: true,
@@ -97,9 +98,10 @@ async function setupCronJobs() {
   });
 
   cron.schedule('0 22 * * *', async () => {
-    console.log('🌅 10:00 PM - predoc scrapper running..');
-    await runWithLock(scrap_predoc, 'scrap_predoc');
-    process.exit(1);  //scrap_predoc, 'scrap_predoc'
+    console.log('🌅 10:00 PM - Jobs-ac scrapper running..');
+    await runWithLock(get_jobs_ac_data, 'get_jobs_ac_data');
+    process.exit(1);
+
   }, {
     scheduled: true,
     timezone: "Africa/Lagos"
@@ -108,10 +110,10 @@ async function setupCronJobs() {
 
 
   console.log('📅 Daily Schedule:');
-  console.log('   - 3:00 AM: First scrap');
-  console.log('   - 10:00 AM: Second scrap');
+  console.log('   - 1:00 AM: First scrap');
+  console.log('   - 8:00 AM: Second scrap');
   console.log('   - 2:00 PM: Third scrap');
-  console.log('   - 6:00 PM: Fourth scrap');
+  console.log('   - 10:00 PM: Fourth scrap');
 }
 
 // --- Server Startup and Graceful Shutdown ---

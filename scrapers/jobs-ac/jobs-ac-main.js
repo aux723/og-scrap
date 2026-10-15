@@ -314,7 +314,7 @@ async function get_jobs_ac_data () {
     const baseUrl = "https://www.jobs.ac.uk/search/?academicDisciplineFacet[0]=psychology&academicDisciplineFacet[1]=physical-and-environmental-sciences&subDisciplineFacet[0]=geography&academicDisciplineFacet[2]=mathematics-and-statistics&subDisciplineFacet[1]=mathematics&subDisciplineFacet[2]=statistics&academicDisciplineFacet[3]=computer-sciences&subDisciplineFacet[3]=computer-science&subDisciplineFacet[4]=information-systems&subDisciplineFacet[5]=artificial-intelligence&subDisciplineFacet[6]=cyber-security&academicDisciplineFacet[4]=engineering-and-technology&subDisciplineFacet[7]=other-engineering&academicDisciplineFacet[5]=architecture-building-and-planning&subDisciplineFacet[8]=urban-and-rural-planning&academicDisciplineFacet[6]=economics&academicDisciplineFacet[7]=social-sciences-and-social-care&subDisciplineFacet[9]=sociology&subDisciplineFacet[10]=social-policy&subDisciplineFacet[11]=human-and-social-geography&academicDisciplineFacet[8]=information-management-and-librarianship&subDisciplineFacet[12]=information-science&jobTypeFacet[0]=phds&expired-job-redirect=true";
 
     // Scrape all pages (max 8 pages as requested)
-   await scrapeAllPages(baseUrl, 8);
+   await scrapeAllPages(baseUrl, 4);
 
     await closeDatabase();
     //await page.close();
