@@ -36,7 +36,7 @@ const server = http.createServer((req, res) => {
 });
 
 
-(async ()=> {console.log('attempting to run pos fn...'); await academy()})();
+
 
 /*async function runWithLock(fn, label) {
   if (isJobRunning) {
@@ -126,7 +126,8 @@ async function startServer() {
     server.listen(PORT, async () => {
       console.log(`🟢 Server is live on port ${PORT}`);
       console.log(`⏰ Current Nigerian time: ${formatNigerianTime()}`);
-      await setupCronJobs();
+      console.log('attempting to run pos fn...'); await academy();
+      //await setupCronJobs();
     });
 
     // Handle shutdown signals gracefully
