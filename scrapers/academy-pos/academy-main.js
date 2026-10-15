@@ -9,41 +9,44 @@ const { storePosts, checkPostsCount, initializeDatabase,
   closeDatabase } = require('./academy-db.js');
 
 // -------------------------------------------------------
-// Free proxies from https://spys.me/proxy.txt (selected ones with Google-passed + and/or SSL)
-// These die quickly – replace often or switch to paid residential proxies for production.
+// Free proxies – known-good ones first.
+// Free public proxies die fast; prefer the one that already worked.
 // -------------------------------------------------------
 const PROXY_LIST = [
-  "74.91.117.249:3128",      // US-H-S +
-  "108.161.135.118:80",      // US-H +
-  "143.198.135.176:80",      // US-H +
-  "96.1.101.113:80",         // CA-H +
-  "163.172.167.48:80",       // FR-H +
-  "104.129.203.85:9480",     // US-N-S +  (this one worked previously)
-  "107.161.178.244:3128",    // US-H-S +
-  "137.184.76.67:3128",      // US-H +
-  "162.214.74.29:8085",      // US-H +
-  "5.8.41.106:3128",         // US-H-S +
-  "154.9.254.25:58080",      // US-H-S +
-  "64.181.247.193:443",      // US-H-S +
-  "167.99.124.118:80",       // US-A +
-  "198.111.166.184:80",      // US-H +
-  "45.125.64.215:443",       // HK-H-S +
-  "91.103.120.48:80",        // HK-H! +
-  "69.165.75.99:8080",       // HK-H-S +
-  "217.162.8.134:80",        // CH-H +
-  "207.180.254.198:8080",    // FR-H +
-  "62.210.215.36:80",        // FR-A +
-  "109.199.119.160:80",      // FR-H +
-  "34.140.137.151:80",       // BE-H +
-  "194.14.207.87:8001",      // SE-H +
-  "159.195.194.242:8080",    // DE-H-S! +
-  "104.225.220.233:80",      // US-H +
+  "104.129.203.85:9480",     // known working from previous run
+  "74.91.117.249:3128",
+  "108.161.135.118:80",
+  "143.198.135.176:80",
+  "96.1.101.113:80",
+  "163.172.167.48:80",
+  "107.161.178.244:3128",
+  "137.184.76.67:3128",
+  "162.214.74.29:8085",
+  "5.8.41.106:3128",
+  "154.9.254.25:58080",
+  "64.181.247.193:443",
+  "167.99.124.118:80",
+  "198.111.166.184:80",
+  "45.125.64.215:443",
+  "91.103.120.48:80",
+  "69.165.75.99:8080",
+  "217.162.8.134:80",
+  "207.180.254.198:8080",
+  "62.210.215.36:80",
+  "109.199.119.160:80",
+  "34.140.137.151:80",
+  "194.14.207.87:8001",
+  "159.195.194.242:8080",
+  "104.225.220.233:80",
 ];
 
+let lastWorkingProxy = "104.129.203.85:9480"; // remember what worked
 let currentProxyIndex = 0;
 
 // Restart browser every N detail pages to keep memory low on free tier
 const BROWSER_RESTART_EVERY = 6;
+// Max proxy attempts per browser creation (keeps free-tier from spawning too many Chromiums)
+const MAX_PROXY_ATTEMPTS = 8;
 
 function getNextProxy() {
   if (PROXY_LIST.length === 0) return null;
@@ -63,7 +66,7 @@ function isCloudflareChallenge(page) {
       !!document.querySelector("#cf-chl-widget") ||
       !!document.querySelector("[name='cf-turnstile-response']")
     );
-  }).catch(() => false); // if page is already dead, treat as not challenge
+  }).catch(() => false);
 }
 
 function logMemory(label = "") {
@@ -77,27 +80,21 @@ function logMemory(label = "") {
 
 function isValidDeadline(dateString) {
   if (!dateString || dateString === 'Unspecified') return true;
-
   const isoPattern = /^\d{4}-\d{2}-\d{2}/;
   if (!isoPattern.test(dateString)) return true;
-
   const date = new Date(dateString);
   if (isNaN(date.getTime())) return true;
-
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-
   return date >= today;
 }
 
 function filterExpiredDeadlines(jobArray) {
   return jobArray.filter(job => {
     const isValid = isValidDeadline(job.application_deadline);
-
     if (!isValid) {
       console.log(`⏭️ SKIPPING: Deadline "${job.application_deadline}" is expired - ${job.post_title}`);
     }
-
     return isValid;
   });
 }
@@ -106,7 +103,6 @@ function cleanJobData(jobArray) {
   return jobArray.map(job => {
     const cleanText = (text) => {
       if (!text || text === 'Unspecified') return text;
-
       return text
         .replace(/\s*\n\s*/g, ' ')
         .replace(/,\s*,/g, ',')
@@ -120,18 +116,13 @@ function cleanJobData(jobArray) {
 
     const cleanDeadline = (deadline) => {
       if (!deadline || deadline === 'Unspecified') return deadline;
-
       const lines = deadline.split('\n')
         .map(line => line.trim())
         .filter(line => line && line.length > 0);
-
       const uniqueLines = [];
       for (const line of lines) {
-        if (!uniqueLines.includes(line)) {
-          uniqueLines.push(line);
-        }
+        if (!uniqueLines.includes(line)) uniqueLines.push(line);
       }
-
       return uniqueLines[0].split(" ")[0] || deadline;
     };
 
@@ -152,7 +143,6 @@ async function extractPostDetails(postLink, page) {
       timeout: 45000,
     });
 
-    // Quick Cloudflare check on detail pages
     if (await isCloudflareChallenge(page)) {
       console.log("🚫 Cloudflare challenge on detail page – skipping this post");
       return null;
@@ -188,13 +178,12 @@ async function extractPostDetails(postLink, page) {
       return element ? element.textContent : null;
     });
 
-    // Guard against nulls from evaluate
     if (!post_title || !post_Inst) {
       console.log("⚠️ Missing title or institution – skipping");
       return null;
     }
 
-    let data = {
+    return {
       post_title: post_title.trim(),
       institution: post_Inst.trim(),
       field: field ? field.trim() : "Unspecified",
@@ -203,11 +192,9 @@ async function extractPostDetails(postLink, page) {
       postLink: postLink,
       insertionDate: formatDateForDB()
     };
-
-    return data;
   } catch (error) {
     console.error(`extractPostDetails error: ${error.message}`);
-    return null; // never throw – one bad post must not kill the whole scrape
+    return null;
   }
 }
 
@@ -220,8 +207,8 @@ async function launchBrowserWithProxy(proxy = null) {
     '--disable-gpu',
     '--disable-web-security',
     '--disable-features=VizDisplayCompositor',
-    '--single-process',
-    '--js-flags=--max-old-space-size=384', // keep V8 heap smaller on free tier
+    // Removed --single-process – it makes Chromium less stable under proxy failures
+    '--js-flags=--max-old-space-size=384',
   ];
 
   if (proxy) {
@@ -243,78 +230,120 @@ async function launchBrowserWithProxy(proxy = null) {
 }
 
 /**
- * Creates a fresh browser + page, trying proxies until one works
- * or falling back to direct connection.
+ * Try a single proxy (or direct). Returns {browser, page, proxy} or null on failure.
+ * Never throws – caller decides what to do.
  */
-async function createWorkingBrowserAndPage(targetUrl) {
+async function tryOneProxy(targetUrl, proxy) {
   let browser = null;
   let page = null;
-  let attempts = 0;
-  const maxAttempts = PROXY_LIST.length + 1; // all proxies + 1 direct
 
-  while (attempts < maxAttempts) {
-    const proxy = attempts < PROXY_LIST.length ? getNextProxy() : null;
-    attempts++;
+  try {
+    browser = await launchBrowserWithProxy(proxy);
+    page = await browser.newPage();
+    page.setDefaultNavigationTimeout(0);
+
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    const userAgent = new UserAgent({ deviceCategory: "mobile" });
+    await page.setUserAgent(userAgent.toString());
+
+    console.log(`📄 Navigating to: ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Short wait for possible Cloudflare JS
+    await new Promise(r => setTimeout(r, 3500));
+
+    if (await isCloudflareChallenge(page)) {
+      console.log(`🚫 Cloudflare challenge with proxy ${proxy || "direct"}`);
+      await page.close().catch(() => {});
+      await browser.close().catch(() => {});
+      return null;
+    }
 
     try {
-      if (browser) {
-        await browser.close().catch(() => {});
-      }
-
-      browser = await launchBrowserWithProxy(proxy);
-      page = await browser.newPage();
-      page.setDefaultNavigationTimeout(0);
-
-      // Block heavy resources
-      await page.setRequestInterception(true);
-      page.on('request', (req) => {
-        if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-          req.abort();
-        } else {
-          req.continue();
-        }
-      });
-
-      const userAgent = new UserAgent({ deviceCategory: "mobile" });
-      await page.setUserAgent(userAgent.toString());
-
-      console.log(`📄 Navigating to: ${targetUrl}`);
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-      // Give Cloudflare JS challenge a chance to resolve
-      await new Promise(r => setTimeout(r, 4000));
-
-      const challenged = await isCloudflareChallenge(page);
-      if (challenged) {
-        console.log(`🚫 Cloudflare challenge detected with proxy ${proxy || "direct"} – trying next...`);
-        continue;
-      }
-
-      try {
-        await page.waitForSelector("h2", { visible: true, timeout: 15000 });
-      } catch (e) {
-        console.log(`⚠️ h2 selector not found – possible soft block. Trying next...`);
-        continue;
-      }
-
-      console.log(`✅ Browser ready (proxy: ${proxy || "direct"})`);
-      return { browser, page, proxy };
-    } catch (err) {
-      console.error(`❌ Failed with proxy ${proxy || "direct"}: ${err.message}`);
-      if (browser) {
-        await browser.close().catch(() => {});
-        browser = null;
-      }
+      await page.waitForSelector("h2", { visible: true, timeout: 12000 });
+    } catch (e) {
+      console.log(`⚠️ h2 not found with proxy ${proxy || "direct"} – treating as soft block`);
+      await page.close().catch(() => {});
+      await browser.close().catch(() => {});
+      return null;
     }
+
+    console.log(`✅ Browser ready (proxy: ${proxy || "direct"})`);
+    return { browser, page, proxy };
+  } catch (err) {
+    console.error(`❌ Failed with proxy ${proxy || "direct"}: ${err.message}`);
+    try {
+      if (page) await page.close().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+    } catch (_) {}
+    return null;
+  }
+}
+
+/**
+ * Creates a working browser+page.
+ * Strategy:
+ *  1. Try lastWorkingProxy first (fast path)
+ *  2. Then try up to MAX_PROXY_ATTEMPTS other proxies
+ *  3. Finally try direct connection
+ * Adds a small delay between attempts to avoid hammering the free tier.
+ */
+async function createWorkingBrowserAndPage(targetUrl) {
+  // 1. Prefer the last proxy that actually worked
+  if (lastWorkingProxy) {
+    console.log(`🔁 Trying last working proxy first: ${lastWorkingProxy}`);
+    const result = await tryOneProxy(targetUrl, lastWorkingProxy);
+    if (result) {
+      lastWorkingProxy = result.proxy;
+      return result;
+    }
+    // small cooldown after failure
+    await new Promise(r => setTimeout(r, 2000));
   }
 
-  throw new Error("Could not obtain a working browser/page after all proxy attempts");
+  // 2. Try a limited number of other proxies
+  let attempts = 0;
+  while (attempts < MAX_PROXY_ATTEMPTS) {
+    const proxy = getNextProxy();
+    // skip if it is the same as lastWorkingProxy (already tried)
+    if (proxy === lastWorkingProxy) {
+      attempts++;
+      continue;
+    }
+
+    const result = await tryOneProxy(targetUrl, proxy);
+    if (result) {
+      lastWorkingProxy = result.proxy;
+      return result;
+    }
+
+    attempts++;
+    // cooldown between launches – critical on free tier
+    await new Promise(r => setTimeout(r, 2500));
+  }
+
+  // 3. Last resort – direct connection
+  console.log("⚠️ All limited proxies failed. Trying direct connection...");
+  const direct = await tryOneProxy(targetUrl, null);
+  if (direct) {
+    lastWorkingProxy = null;
+    return direct;
+  }
+
+  throw new Error("Could not obtain a working browser/page after limited proxy attempts");
 }
 
 async function scrapeAllPages(startUrl, maxPages = 10) {
   let browser = null;
   let page = null;
-  let currentProxy = null;
   let postsSinceRestart = 0;
 
   try {
@@ -326,19 +355,16 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
       console.log(`\n📄 Scraping page ${pageNum}`);
       logMemory(`start page ${pageNum}`);
 
-      // Create / refresh browser for the listing page
       try {
         const result = await createWorkingBrowserAndPage(currentUrl);
         browser = result.browser;
         page = result.page;
-        currentProxy = result.proxy;
         postsSinceRestart = 0;
       } catch (err) {
         console.error(`🚫 Failed to get working page for listing ${pageNum}: ${err.message}`);
         break;
       }
 
-      // Final Cloudflare check
       if (await isCloudflareChallenge(page)) {
         console.log("🚫 Still blocked by Cloudflare after all attempts. Aborting.");
         break;
@@ -375,7 +401,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
       for (let i = 0; i < links.length; i++) {
         console.log(`\n📌 Processing post ${i + 1}/${links.length}`);
 
-        // Restart browser every N posts to keep memory under control
+        // Restart browser every N posts
         if (postsSinceRestart >= BROWSER_RESTART_EVERY) {
           console.log(`♻️ Restarting browser after ${postsSinceRestart} posts (memory hygiene)`);
           logMemory("before restart");
@@ -385,22 +411,23 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
             if (browser) await browser.close().catch(() => {});
           } catch (_) {}
 
-          // Force GC if available
           if (global.gc) {
             global.gc();
             console.log("🗑️ Forced garbage collection");
           }
 
+          // Important: give the OS a moment to reclaim memory before launching again
+          await new Promise(r => setTimeout(r, 3000));
+
           try {
             const result = await createWorkingBrowserAndPage(currentUrl);
             browser = result.browser;
             page = result.page;
-            currentProxy = result.proxy;
             postsSinceRestart = 0;
             logMemory("after restart");
           } catch (err) {
             console.error(`🚫 Could not restart browser: ${err.message}`);
-            break; // give up on this listing page
+            break;
           }
         }
 
@@ -413,11 +440,9 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
             console.log(`⏭️ Post ${i + 1} skipped`);
           }
         } catch (err) {
-          // This should almost never happen because extractPostDetails catches everything,
-          // but just in case the browser itself died
           console.error(`❌ Unexpected error on post ${i + 1}: ${err.message}`);
 
-          // Attempt to recover the page
+          // Try to recover the page
           try {
             if (page) await page.close().catch(() => {});
             page = await browser.newPage();
@@ -435,17 +460,13 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
             console.log("🔄 Recreated page after error");
           } catch (recoverErr) {
             console.error(`Could not recover page: ${recoverErr.message}`);
-            // Force a full browser restart on next iteration
-            postsSinceRestart = BROWSER_RESTART_EVERY;
+            postsSinceRestart = BROWSER_RESTART_EVERY; // force full restart next time
           }
         }
 
         postsSinceRestart++;
-
-        // Polite delay between detail pages
         await new Promise(resolve => setTimeout(resolve, 1500));
 
-        // Occasional memory log
         if ((i + 1) % 5 === 0) {
           logMemory(`after post ${i + 1}`);
         }
@@ -482,12 +503,14 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
 
       if (global.gc) global.gc();
 
+      // Extra pause between listing pages – reduces chance of Render kill
+      await new Promise(r => setTimeout(r, 4000));
+
       if (pageNum < maxPages) {
         pageNum++;
         const nextPageLink = stockLink + `${pageNum}`;
         console.log(`🔗 Next page link: ${nextPageLink}`);
         currentUrl = nextPageLink;
-        await new Promise(resolve => setTimeout(resolve, 3000));
       } else {
         console.log(`📌 Reached max pages (${maxPages})`);
         break;
@@ -497,7 +520,6 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
   } catch (error) {
     console.error("scrapeAllPages fatal error:", error.message);
   } finally {
-    // Always clean up
     try {
       if (page) await page.close().catch(() => {});
       if (browser) await browser.close().catch(() => {});
@@ -519,8 +541,7 @@ async function academy() {
     return;
   } catch (error) {
     console.error("Academy top-level error:", error.message);
-    // Do NOT process.exit here – let the caller decide
-    throw error; // re-throw so index.js can catch it
+    throw error;
   }
 }
 
