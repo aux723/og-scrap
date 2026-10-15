@@ -1,5 +1,3 @@
-
-
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 puppeteer.use(StealthPlugin());
@@ -18,7 +16,6 @@ function isValidDeadline(dateString) {
   const isoPattern = /^\d{4}-\d{2}-\d{2}/;
   if (!isoPattern.test(dateString)) return true; // Keep if not ISO format
 
-  // No need to split - dateString is already just "YYYY-MM-DD"
   const date = new Date(dateString);
 
   // Check if date is valid
@@ -97,6 +94,26 @@ async function extractPostDetails (postLink, page) {
       waitUntil: "domcontentloaded",
     });
 
+    // Cloudflare check & bypass validation
+    await page.waitForFunction(() => {
+      return !document.title.includes('Just a moment') &&
+             !document.body.innerText.includes('security verification');
+    }, { timeout: 45000 }).catch(() => {
+      console.log('⚠️ Still on Cloudflare challenge after 45s');
+    });
+
+    const isChallenge = await page.evaluate(() =>
+      document.title.includes('Just a moment') ||
+      document.body.innerText.includes('Performing security verification')
+    );
+
+    if (isChallenge) {
+      console.log('🚫 Cloudflare challenge detected – aborting this post page');
+      return null;
+    } else {
+      console.log('✅ Cloudflare detection bypassed successfully on post page');
+    }
+
     await page.waitForSelector("#jobDetails", {
       visible: true,
       timeout: 0,
@@ -118,42 +135,38 @@ async function extractPostDetails (postLink, page) {
       return element ? element.textContent : null;
     });
 
-    //post_Inst = trimInst(post_Inst);
-
     let app_link = await page.evaluate(() => {
-      const element = document.querySelector('#gtm-job-ad-apply-now-bottom-section'); //if link == apply; app_Link = Post_Link
+      const element = document.querySelector('#gtm-job-ad-apply-now-bottom-section');
       return element ? element.href : null;
     });
 
     let post_deadline = await page.evaluate(() => {
       const element = document.querySelector('#jobDetails > div > div:nth-child(5) > div.col-auto.col-md-8');
       return element ? element.textContent : null;
-    }); //deadline format: 2026-06-14 || Unspecified
+    });
 
 
     let data = {
-      post_title: post_title.trim(),
-      institution: post_Inst.trim(),
-      field: field.trim(),
+      post_title: post_title ? post_title.trim() : 'Unspecified',
+      institution: post_Inst ? post_Inst.trim() : 'Unspecified',
+      field: field ? field.trim() : 'Unspecified',
       application_link: app_link,
-      application_deadline: post_deadline.trim(),     //rolling posts deleted at the end of the scrap year (db code using the extracted year to delete post from db)
+      application_deadline: post_deadline ? post_deadline.trim() : 'Unspecified',
       postLink: `${postLink}`,
       insertionDate: formatDateForDB()
     };
 
     return data;
   } catch (error) {
-    console.error(error.message)
+    console.error('Error in extractPostDetails:', error.message);
+    return null;
   }
-
 };
 
 
 async function scrapeAllPages (startUrl, maxPages = 10) {
-
-
-    let browser;
-    browser = await puppeteer.launch({
+  let browser;
+  browser = await puppeteer.launch({
     headless: true,
     args: [
       '--no-sandbox',
@@ -170,13 +183,10 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
     handleSIGHUP: false,
   });
 
-
   let page;
 
   try {
-
     page = await browser.newPage();
-    // remove timeout limit
     page.setDefaultNavigationTimeout(0);
 
     // Block images, stylesheets, and fonts to save memory and bandwidth
@@ -189,28 +199,49 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
       }
     });
 
-    let userAgent = new UserAgent({ deviceCategory: "mobile" }); //desktop
+    let userAgent = new UserAgent({ deviceCategory: "mobile" });
     let randomAgent = userAgent.toString();
     await page.setUserAgent(randomAgent);
 
-    let currentUrl = startUrl;  let nextPageLink; let stockLink = "https://academicpositions.com/jobs/position/phd?page=";
+    let currentUrl = startUrl;
+    let nextPageLink;
+    let stockLink = "https://academicpositions.com/jobs/position/phd?page=";
     let pageNum = 1;
 
     while (pageNum <= maxPages) {
-
-      console.log(`\n📄 Scraping page ${pageNum}: `); //${currentUrl}
+      console.log(`\n📄 Scraping page ${pageNum}: `);
 
       // Navigate to the current page
       await page.goto(currentUrl, {
         waitUntil: "domcontentloaded",
       });
 
+      // Cloudflare check & bypass validation for listing page
+      await page.waitForFunction(() => {
+        return !document.title.includes('Just a moment') &&
+               !document.body.innerText.includes('security verification');
+      }, { timeout: 45000 }).catch(() => {
+        console.log('⚠️ Still on Cloudflare challenge after 45s');
+      });
+
+      const isChallenge = await page.evaluate(() =>
+        document.title.includes('Just a moment') ||
+        document.body.innerText.includes('Performing security verification')
+      );
+
+      if (isChallenge) {
+        console.log('🚫 Cloudflare challenge detected – skipping this listing page');
+        pageNum++;
+        currentUrl = stockLink + `${pageNum}`;
+        continue;
+      } else {
+        console.log('✅ Cloudflare detection bypassed successfully on listing page');
+      }
 
       await page.waitForSelector("h2", {
         visible: true,
         timeout: 0,
       });
-
 
       let links = await page.evaluate(() => {
         let jobListingElements = document.querySelectorAll(".list-group-item.text-reset.text-decoration-none > a");
@@ -227,7 +258,6 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
 
       console.log(`Found ${links.length} job links on page ${pageNum}`);
       if (links.length === 0) {
-        // Helpful debug when the list is empty
         const debug = await page.evaluate(() => ({
           title: document.title,
           url: location.href,
@@ -238,15 +268,7 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
         console.log('DEBUG (empty links):', JSON.stringify(debug, null, 2));
       };
 
-      const listHtml = await page.evaluate(() => {
-        const el = document.querySelector('.list-group') || document.body;
-        return el ? el.outerHTML.slice(0, 2000) : 'no list-group';
-      });
-      console.log('List HTML snippet:', listHtml);
-
-      //links = links.slice(0, 10);
       let postsDetailsArr = [];
-
 
       for (let i = 0; i < links.length; i++) {
         console.log(`\n📌 Processing post ${i + 1}/${links.length}`);
@@ -256,7 +278,7 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
             postsDetailsArr.push(result);
             console.log(`✅ Post ${i + 1} added successfully`);
           } else {
-            console.log(`⏭️ Post ${i + 1} skipped (deadline expired)`);
+            console.log(`⏭️ Post ${i + 1} skipped (blocked or expired)`);
           }
         } catch (err) {
           console.error(`❌ Failed to extract post ${i + 1}:`, err.message);
@@ -266,36 +288,30 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
         await new Promise(resolve => setTimeout(resolve, 1000));
       };
 
-      console.log(`\n🎉 Extraction complete!`);
+      console.log(`\n🎉 Extraction complete for page ${pageNum}!`);
       console.log(`Total posts collected: ${postsDetailsArr.length}`);
       postsDetailsArr = cleanJobData(postsDetailsArr);
-      //check for stale dates here using filter
-      postsDetailsArr = filterExpiredDeadlines(postsDetailsArr); //filter out "Unspecified deadline"
-      postsDetailsArr = postsDetailsArr.filter(p=>{
+      postsDetailsArr = filterExpiredDeadlines(postsDetailsArr);
+      postsDetailsArr = postsDetailsArr.filter(p => {
         if(p.application_deadline != "Unspecified") {
-          return p
+          return p;
         }
       });
 
       console.log(`✅ Total valid posts after filtering: ${postsDetailsArr.length}`);
-      //console.log(postsDetailsArr); //send batch to DB here;
       await checkPostsCount();
       let result = await storePosts(postsDetailsArr);
-      if (result && result.success && result.inserted) {console.log(`successfully stored posts ..${result.inserted}\nDetails: \n`, result)} else {console.log('No new documents available to insert at this time..', result)};
-      /*console.log("proceeding to find next page link..")
-      let dt =  await page.goto(currentUrl, {
-      waitUntil: "domcontentloaded",
-    });*/
-
-    //console.log(dt)
-    //https://academicpositions.com/jobs/position/phd?page=3
+      if (result && result.success && result.inserted) {
+        console.log(`successfully stored posts ..${result.inserted}\nDetails: \n`, result);
+      } else {
+        console.log('No new documents available to insert at this time..', result);
+      }
 
       if (pageNum < maxPages) {
         pageNum++;
         nextPageLink = stockLink + `${pageNum}`;
-        console.log(`🔗 Next page link found:\n `, nextPageLink); //${nextPageLink}
+        console.log(`🔗 Next page link prepared:\n `, nextPageLink);
         currentUrl = nextPageLink;
-
 
         // Add delay between page requests
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -303,46 +319,30 @@ async function scrapeAllPages (startUrl, maxPages = 10) {
         console.log(`📌 No more pages or reached max pages (${maxPages})`);
         break;
       }
-
-
-     };
-
-
-
+    };
 
     await page.close();
     await browser.close();
     return;
 
-
   } catch (error) {
-    console.error(error);
+    console.error('Error in scrapeAllPages:', error);
   }
 };
 
 
 async function academy () {
-
   try {
-
     await initializeDatabase();
-
     const baseUrl = "https://academicpositions.com/jobs/position/phd?page=";
-
     await scrapeAllPages(baseUrl, 2);
-
     await closeDatabase();
-    console.log('returning to outer cron scope?...')
+    console.log('returning to outer cron scope?...');
     return;
-
-
   } catch (error) {
     console.error(error);
     process.exit(1);
   }
 }
 
-
-//console.profile();
-//(async ()=> await academy())();
-module.exports = {academy}
+module.exports = { academy };
