@@ -78,14 +78,8 @@ async function runAndExit(fn, label) {
   }
 }
 
-// --- Cron Jobs (Africa/Lagos = GMT+1) ---
-// Schedule:
-//   3:00 AM  – sa_base_scraper
-//   5:00 AM  – base_scraper (sft)
-//   8:00 AM  – academy (academicpositions.com)
-//   6:00 PM  – scrap_predoc
-//  10:00 PM  – get_jobs_ac_data
-async function setupCronJobs() {
+
+/*async function setupCronJobs() {
   cron.schedule(
     "0 3 * * *",
     async () => {
@@ -137,7 +131,7 @@ async function setupCronJobs() {
   console.log("   - 8:00 AM  → AcademicPositions (academy)");
   console.log("   - 6:00 PM  → Predoc");
   console.log("   - 10:00 PM → Jobs-ac");
-}
+}*/
 
 // --- Server Startup and Graceful Shutdown ---
 async function startServer() {
@@ -147,7 +141,14 @@ async function startServer() {
     server.listen(PORT, async () => {
       console.log(`🟢 Server is live on port ${PORT}`);
       console.log(`⏰ Current Nigerian time: ${formatNigerianTime()}`);
-      await setupCronJobs();
+      console.log(`running acad-pos..`);
+      
+      try {
+        await academy();
+      } catch (error) {
+        console.error (error.message)
+      }
+      //await setupCronJobs();
     });
 
     const shutdown = async () => {
