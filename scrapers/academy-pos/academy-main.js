@@ -669,6 +669,9 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
       postsDetailsArr = postsDetailsArr.filter(
         (p) => p.application_deadline !== "Unspecified"
       );
+      postsDetailsArr = postsDetailsArr.filter(
+        (p) => p.application_link !== null
+      );
 
       console.log(
         `✅ Total valid posts after filtering: ${postsDetailsArr.length}`
