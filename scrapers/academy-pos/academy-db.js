@@ -1,79 +1,113 @@
 const { MongoClient } = require("mongodb");
 require("dotenv").config();
-// Use environment variable for the database URI for security
 
+// Use environment variable for the database URI for security
 const uri = process.env.MONGODB_URI;
 if (!uri) {
   throw new Error("MONGODB_URI environment variable not set.");
 }
 
-let client = new MongoClient(uri, {
-  maxPoolSize: 10,
-  minPoolSize: 2,
-  maxIdleTimeMS: 30000,
-  serverSelectionTimeoutMS: 45000,
-  socketTimeoutMS: 45000,
-});
+const DB_NAME = "academy-db";
+const SCHOLARSHIPS_COLLECTION = "academy-db-scholarships";
+const PROXY_COLLECTION = "academy-db-proxy";      // holds one doc: the batch that last produced a working proxy
+const PROXY_CURSOR_ID = "proxy-cursor";
 
-let db; // This variable will hold the database instance once connected
+let client = null; // MongoClient (created per initializeDatabase call)
+let db = null;     // database instance once connected
+
+function buildClient() {
+  return new MongoClient(uri, {
+    maxPoolSize: 5,            // free tier: keep the footprint small
+    minPoolSize: 1,
+    maxIdleTimeMS: 30000,
+    connectTimeoutMS: 20000,
+    serverSelectionTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+  });
+}
+
+function getDb() {
+  if (!db) throw new Error("Database not initialised. Call initializeDatabase() first.");
+  return db;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Connects to the MongoDB database. Should be called once at application startup.
+ * Connects to MongoDB. Safe to call more than once (no-op if already connected).
+ * THROWS on failure instead of calling process.exit(), so the caller decides what to do.
  */
 async function initializeDatabase() {
-  try {
-    await client.connect();
-    db = client.db("academy-db");
+  if (db) return;
 
-    // Create indexes for better query performance
-    await createIndexes();
-    console.log("✅ Successfully connected to MongoDB Atlas!");
-  } catch (error) {
-    console.error("⛔ Error connecting to MongoDB Atlas:", error);
-    process.exit(1);
+  const MAX_ATTEMPTS = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const candidate = buildClient();
+    try {
+      await candidate.connect();
+      client = candidate;
+      db = client.db(DB_NAME);
+      await createIndexes();
+      console.log("✅ Successfully connected to MongoDB Atlas!");
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(`⛔ MongoDB connect attempt ${attempt}/${MAX_ATTEMPTS} failed:`, error.message);
+      await candidate.close().catch(() => {});
+      client = null;
+      db = null;
+      if (attempt < MAX_ATTEMPTS) await sleep(2000 * attempt);
+    }
   }
+
+  throw new Error(`Could not connect to MongoDB Atlas: ${lastError && lastError.message}`);
 }
 
 /**
- * Creates necessary indexes for optimal query performance
+ * Creates necessary indexes. Each one is independent: one failing never blocks the others.
  */
 async function createIndexes() {
-  try {
-    let academyDB_Collection = db.collection("academy-db-scholarships");
+  const scholarships = db.collection(SCHOLARSHIPS_COLLECTION);
 
-    // Create indexes in parallel for better performance
-    await Promise.all([
-      academyDB_Collection.createIndex({ post_title: 1 }, { background: true }),
-      academyDB_Collection.createIndex({ application_deadline: 1 }, { background: true }),
-      academyDB_Collection.createIndex({ application_link: 1 }, { unique: true, background: true }),
-    ]);
+  const results = await Promise.allSettled([
+    scholarships.createIndex({ post_title: 1 }, { background: true }),
+    scholarships.createIndex({ application_deadline: 1 }, { background: true }),
+    scholarships.createIndex({ application_link: 1 }, { unique: true, background: true }),
+  ]);
 
+  const failed = results.filter((r) => r.status === "rejected");
+  if (failed.length) {
+    failed.forEach((f) => console.error("⛔ Index error:", f.reason && f.reason.message));
+    console.log("ℹ️ Application will continue without some indexes");
+  } else {
     console.log("✅ Database indexing configuration completed");
-    return;
-    // For Posted-Jobs, we'll create the index when the collection is first used
-    // This is handled in addDocumentToPostedDb function
-  } catch (error) {
-    console.error("⛔ Error configuring indexes:", error);
-    // Non-critical error, don't throw
-    console.log("ℹ️ Application will continue without optimal indexes");
   }
 }
 
 /**
- * Closes the MongoDB connection. Should be called once during application shutdown.
+ * Closes the MongoDB connection. Never throws and never exits the process.
  */
 async function closeDatabase() {
+  const current = client;
+  client = null;
+  db = null;
+  if (!current) return;
   try {
-    await client.close();
+    await current.close();
     console.log("🔌 MongoDB connection closed.");
   } catch (error) {
-    console.error("⛔ Error closing MongoDB connection:", error);
-    process.exit(1);
+    console.error("⛔ Error closing MongoDB connection:", error.message);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Scholarship posts
+// ---------------------------------------------------------------------------
+
 async function storePosts(postsArr) {
-  const posts = Array.isArray(postsArr) ? postsArr : [postsArr];
+  const posts = (Array.isArray(postsArr) ? postsArr : [postsArr]).filter(Boolean);
 
   if (posts.length === 0) {
     return {
@@ -86,7 +120,9 @@ async function storePosts(postsArr) {
   }
 
   try {
-    const result = await db.collection("academy-db-scholarships").insertMany(posts, { ordered: false });
+    const result = await getDb()
+      .collection(SCHOLARSHIPS_COLLECTION)
+      .insertMany(posts, { ordered: false });
 
     return {
       success: true,
@@ -96,26 +132,28 @@ async function storePosts(postsArr) {
       errors: 0,
     };
   } catch (error) {
-    // If the error is a bulk write error (some succeeded, some failed)
-    if (error.name === "MongoBulkWriteError" || error.result) {
-      const inserted = error.result.insertedCount;
-      const duplicateCount = error.writeErrors?.filter((err) => err.code === 11000).length || 0;
-      const otherErrors = (error.writeErrors?.length || 0) - duplicateCount;
+    // Some succeeded, some failed (typically duplicates)
+    if (error && (error.name === "MongoBulkWriteError" || error.result)) {
+      const inserted =
+        (error.result && error.result.insertedCount) ?? error.insertedCount ?? 0;
+      const writeErrors = [].concat(error.writeErrors || []); // can be a single object or array
+      const duplicateCount = writeErrors.filter((e) => e.code === 11000).length;
+      const otherErrors = writeErrors.length - duplicateCount;
 
       return {
         success: true,
         message: `Processed ${posts.length} scholar post(s) with partial successes`,
-        inserted: inserted,
+        inserted,
         duplicates: duplicateCount,
         errors: otherErrors,
       };
     }
 
-    // Handle complete system/connection failures
+    // Complete system / connection failure
     console.error("Critical error in storage operation:", error.message);
     return {
       success: false,
-      message: "Failed to process jobs",
+      message: "Failed to process posts",
       error: error.message,
       attempted: posts.length,
     };
@@ -124,93 +162,60 @@ async function storePosts(postsArr) {
 
 async function checkPostsCount() {
   try {
-    // Get collection from the shared 'db' instance
-    let sa_Collection = db.collection("academy-db-scholarships");
+    const collection = getDb().collection(SCHOLARSHIPS_COLLECTION);
 
-    // Use estimatedDocumentCount for better performance on large collections
-    let count = await sa_Collection.estimatedDocumentCount();
+    // estimatedDocumentCount is cheap on large collections
+    const count = await collection.estimatedDocumentCount();
 
     if (count > 10000) {
-      console.log(`🗑️ Posted-Jobs collection has ~${count} documents. Deleting...`);
-
-      let result = await sa_Collection.deleteMany(
-        {},
-        {
-          writeConcern: { w: 1, j: false },
-        }
-      );
-
-      console.log(`✅ Deleted ${result.deletedCount} documents from Posted-Jobs.`);
-      sa_Collection = null;
+      console.log(`🗑️ Scholarships collection has ~${count} documents. Deleting...`);
+      const result = await collection.deleteMany({}, { writeConcern: { w: 1, j: false } });
+      console.log(`✅ Deleted ${result.deletedCount} documents.`);
     } else {
-      console.log(
-        `Documents are within the target count threshold (10,000 docs)\ncurrent count: `,
-        count
-      );
+      console.log(`Documents are within the target count threshold (10,000 docs)\ncurrent count: ${count}`);
     }
   } catch (error) {
-    console.error("⛔ Error managing Posted-Jobs collection:", error.message);
-    process.exit(1);
+    // Housekeeping only – must never take the scraper down
+    console.error("⛔ Error managing scholarships collection:", error.message);
   }
 }
 
-// -------------------------------------------------------
-// Persistent working-proxy storage (survives process restarts)
-// Collection: academy-db-config  |  document _id: "workingProxy"
-// -------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Persistent proxy search position
+// Only the BATCH INDEX that produced the last working proxy is stored (not the proxy
+// itself). Both functions swallow their own errors so a DB hiccup never crashes a run.
+// ---------------------------------------------------------------------------
 
 /**
- * Retrieve the last known working proxy from the database.
- * @returns {Promise<string|null>} proxy string (ip:port) or null
+ * Returns the batch index that last produced a working proxy, or null if none is stored.
  */
-async function getWorkingProxy() {
+async function getProxyBatchIndex() {
   try {
-    const doc = await db.collection("academy-db-config").findOne({ _id: "workingProxy" });
-    if (doc && doc.proxy) {
-      console.log(`📂 Loaded persisted working proxy from DB: ${doc.proxy}`);
-      return doc.proxy;
-    }
-    return null;
+    const doc = await getDb().collection(PROXY_COLLECTION).findOne({ _id: PROXY_CURSOR_ID });
+    return doc && Number.isInteger(doc.batchIndex) ? doc.batchIndex : null;
   } catch (error) {
-    console.error("⛔ Error reading working proxy from DB:", error.message);
+    console.error("⚠️ Could not read proxy batch index:", error.message);
     return null;
   }
 }
 
 /**
- * Persist (upsert) the current working proxy.
- * @param {string|null} proxy  ip:port string, or null to clear
+ * Stores the batch index that produced a working proxy.
  */
-async function saveWorkingProxy(proxy) {
+async function saveProxyBatchIndex(batchIndex, { batchSize = null } = {}) {
+  if (!Number.isInteger(batchIndex)) return false;
   try {
-    if (!proxy) {
-      await db.collection("academy-db-config").deleteOne({ _id: "workingProxy" });
-      console.log("🗑️ Cleared persisted working proxy from DB");
-      return;
-    }
-
-    await db.collection("academy-db-config").updateOne(
-      { _id: "workingProxy" },
-      {
-        $set: {
-          proxy,
-          updatedAt: new Date(),
-        },
-      },
+    await getDb().collection(PROXY_COLLECTION).updateOne(
+      { _id: PROXY_CURSOR_ID },
+      { $set: { batchIndex, batchSize, updatedAt: new Date() } },
       { upsert: true }
     );
-    console.log(`💾 Persisted working proxy to DB: ${proxy}`);
+    console.log(`💾 Saved proxy batch index to DB: ${batchIndex}`);
+    return true;
   } catch (error) {
-    console.error("⛔ Error saving working proxy to DB:", error.message);
-    // Non-critical – continue without persistence
+    console.error("⚠️ Could not save proxy batch index:", error.message);
+    return false;
   }
-}
-
-/**
- * Clear the persisted working proxy (e.g. when it fails).
- */
-async function clearWorkingProxy() {
-  return saveWorkingProxy(null);
 }
 
 module.exports = {
@@ -218,7 +223,6 @@ module.exports = {
   closeDatabase,
   storePosts,
   checkPostsCount,
-  getWorkingProxy,
-  saveWorkingProxy,
-  clearWorkingProxy,
+  getProxyBatchIndex,
+  saveProxyBatchIndex,
 };
