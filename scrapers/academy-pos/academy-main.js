@@ -12,6 +12,7 @@ const {
   closeDatabase,
   getProxyBatchIndex,
   saveProxyBatchIndex,
+  clearProxyBatchIndex,
 } = require("./academy-db.js");
 
 // -------------------------------------------------------
@@ -719,7 +720,14 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
   } catch (error) {
     console.error("scrapeAllPages fatal error:", error.message);
   } finally {
+    // Close browser first
     await closeBrowserResources(browser, page);
+    browser = null;
+    page = null;
+
+    // Clear persisted batch index after scrape completes (before GC)
+    await clearProxyBatchIndex();
+
     if (global.gc) global.gc();
     logMemory("final cleanup");
   }

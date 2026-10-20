@@ -201,6 +201,23 @@ async function saveProxyBatchIndex(batchIndex) {
   }
 }
 
+/**
+ * Delete the persisted proxy batch index after a full scrape run completes.
+ */
+async function clearProxyBatchIndex() {
+  try {
+    const result = await db.collection("academy-db-config").deleteOne({ _id: "proxyBatch" });
+    if (result.deletedCount > 0) {
+      console.log("🗑️ Cleared proxy batch index from DB");
+    } else {
+      console.log("ℹ️ No proxy batch index to clear");
+    }
+  } catch (error) {
+    console.error("⛔ Error clearing proxy batch index from DB:", error.message);
+    // Non-critical
+  }
+}
+
 module.exports = {
   initializeDatabase,
   closeDatabase,
@@ -208,4 +225,5 @@ module.exports = {
   checkPostsCount,
   getProxyBatchIndex,
   saveProxyBatchIndex,
+  clearProxyBatchIndex,
 };
