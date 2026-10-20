@@ -1,58 +1,93 @@
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-const AdblockerPlugin = require("puppeteer-extra-plugin-adblocker");
-const UserAgent = require("user-agents");
-const net = require("net");
-
 puppeteer.use(StealthPlugin());
+const AdblockerPlugin = require("puppeteer-extra-plugin-adblocker");
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
-
+const UserAgent = require("user-agents");
 const { formatDateForDB } = require("../../utils/dateHelpers.js");
 const {
   storePosts,
   checkPostsCount,
   initializeDatabase,
   closeDatabase,
-  getTopProxies,
-  recordProxySuccess,
-  recordProxyFail,
-  pruneProxyCache,
+  getWorkingProxy,
+  saveWorkingProxy,
+  clearWorkingProxy,
 } = require("./academy-db.js");
 
-/* ------------------------------------------------------------------ */
-/*  Configuration – tuned for Render free tier (0.1 vCPU / 512 MB)    */
-/* ------------------------------------------------------------------ */
-
+// -------------------------------------------------------
+// Dynamic proxy loading from https://spys.me/proxy.txt
+// Proxies kept in the exact order they appear on the site.
+// Walk the full list in batches of BATCH_SIZE until a working
+// proxy is found, then reuse that proxy for the rest of the run.
+// The working proxy is also persisted to MongoDB so it survives
+// process restarts.
+// -------------------------------------------------------
 const PROXY_SOURCE_URL = "https://spys.me/proxy.txt";
-const MAX_PAGES = 10;
-const LINKS_PER_PAGE = 30;
-const BROWSER_RESTART_EVERY = 18;
-const MEMORY_LIMIT_MB = 400;
-const PROXY_TEST_CONCURRENCY = 1;          // MUST stay 1 on free tier
-const PROXY_TEST_TIMEOUT_MS = 22000;
-const COOLDOWN_MS = 700;
-const DETAIL_NAV_TIMEOUT = 25000;
-const LISTING_NAV_TIMEOUT = 28000;
+const BATCH_SIZE = 25; // try 25 at a time
+const BROWSER_RESTART_EVERY = 6; // restart Chromium every N detail pages
+const LINKS_PER_PAGE = 20; // max job links per listing page
+const COOLDOWN_MS = 2000; // pause between failed proxy attempts
 
-/* ------------------------------------------------------------------ */
-/*  Process-lifetime state                                            */
-/* ------------------------------------------------------------------ */
-
+// Process-lifetime state
 let lastWorkingProxy = null;
-let allProxies = [];
-let proxyCursor = 0;
+let allProxies = []; // full list from spys.me (website order)
+let proxyCursor = 0; // where we are in the full list
 
-/* ------------------------------------------------------------------ */
-/*  Utility helpers                                                   */
-/* ------------------------------------------------------------------ */
+/**
+ * Fetch + parse the entire proxy list from spys.me.
+ * Keeps the exact order as listed on the website (no scoring).
+ * Memory cost is tiny (just strings).
+ */
+async function fetchFreshProxies() {
+  console.log(`📡 Fetching fresh proxies from ${PROXY_SOURCE_URL} ...`);
+  try {
+    const res = await fetch(PROXY_SOURCE_URL, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; proxy-fetcher/1.0)" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
 
-function logMemory(label = "") {
-  const used = process.memoryUsage();
-  const mb = (b) => (b / 1024 / 1024).toFixed(1);
-  console.log(
-    `🧠 Memory${label ? " [" + label + "]" : ""}: ` +
-      `rss=${mb(used.rss)}MB  heap=${mb(used.heapUsed)}MB`
-  );
+    const lines = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const list = [];
+
+    // Keep exact order as listed on the website (no scoring / reordering)
+    for (const line of lines) {
+      // Format: 45.125.64.215:443 HK-H-S +
+      const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})\b/);
+      if (!m) continue;
+      list.push(m[1]); // "ip:port" only
+    }
+
+    // Deduplicate while preserving website order
+    const unique = [...new Set(list)];
+
+    // Put lastWorkingProxy at the very front if we have one
+    if (lastWorkingProxy) {
+      const without = unique.filter((p) => p !== lastWorkingProxy);
+      without.unshift(lastWorkingProxy);
+      console.log(
+        `✅ Loaded ${without.length} proxies (website order, last-working first)`
+      );
+      return without;
+    }
+
+    console.log(`✅ Loaded ${unique.length} proxies (website order)`);
+    return unique;
+  } catch (err) {
+    console.error(`⚠️ Failed to fetch proxies: ${err.message}`);
+    if (lastWorkingProxy) {
+      console.log(
+        `🔁 Falling back to last known good proxy: ${lastWorkingProxy}`
+      );
+      return [lastWorkingProxy];
+    }
+    return [];
+  }
 }
 
 function isCloudflareChallenge(page) {
@@ -73,9 +108,21 @@ function isCloudflareChallenge(page) {
     .catch(() => false);
 }
 
+function logMemory(label = "") {
+  const used = process.memoryUsage();
+  const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1);
+  console.log(
+    `🧠 Memory${label ? " [" + label + "]" : ""}: ` +
+      `rss=${mb(used.rss)}MB  heapUsed=${mb(used.heapUsed)}MB  external=${mb(
+        used.external
+      )}MB`
+  );
+}
+
 function isValidDeadline(dateString) {
   if (!dateString || dateString === "Unspecified") return true;
-  if (!/^\d{4}-\d{2}-\d{2}/.test(dateString)) return true;
+  const isoPattern = /^\d{4}-\d{2}-\d{2}/;
+  if (!isoPattern.test(dateString)) return true;
   const date = new Date(dateString);
   if (isNaN(date.getTime())) return true;
   const today = new Date();
@@ -85,13 +132,13 @@ function isValidDeadline(dateString) {
 
 function filterExpiredDeadlines(jobArray) {
   return jobArray.filter((job) => {
-    const ok = isValidDeadline(job.application_deadline);
-    if (!ok) {
+    const isValid = isValidDeadline(job.application_deadline);
+    if (!isValid) {
       console.log(
-        `⏭️ SKIPPING expired: ${job.application_deadline} – ${job.post_title}`
+        `⏭️ SKIPPING: Deadline "${job.application_deadline}" is expired - ${job.post_title}`
       );
     }
-    return ok;
+    return isValid;
   });
 }
 
@@ -105,6 +152,8 @@ function cleanJobData(jobArray) {
         .replace(/\s+/g, " ")
         .replace(/,\s+(and\s+\d+\s+more)/i, ", $1")
         .replace(/\s*,\s*/g, ", ")
+        .replace(/,\s*,/g, ",")
+        .replace(/,\s+(?![^,]*and\s+\d+\s+more)/g, ", ")
         .trim();
     };
 
@@ -112,10 +161,13 @@ function cleanJobData(jobArray) {
       if (!deadline || deadline === "Unspecified") return deadline;
       const lines = deadline
         .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-      const unique = [...new Set(lines)];
-      return unique[0]?.split(" ")[0] || deadline;
+        .map((line) => line.trim())
+        .filter((line) => line && line.length > 0);
+      const uniqueLines = [];
+      for (const line of lines) {
+        if (!uniqueLines.includes(line)) uniqueLines.push(line);
+      }
+      return uniqueLines[0].split(" ")[0] || deadline;
     };
 
     return {
@@ -126,97 +178,79 @@ function cleanJobData(jobArray) {
   });
 }
 
-/* ------------------------------------------------------------------ */
-/*  Lightweight TCP connectivity check                                */
-/* ------------------------------------------------------------------ */
-
-function tcpConnectCheck(proxy, timeout = 3000) {
-  return new Promise((resolve) => {
-    const [host, portStr] = proxy.split(":");
-    const port = parseInt(portStr, 10);
-    if (!host || !port) return resolve(false);
-
-    const socket = new net.Socket();
-    let settled = false;
-
-    const done = (ok) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(ok);
-    };
-
-    socket.setTimeout(timeout);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-
-    try {
-      socket.connect(port, host);
-    } catch {
-      done(false);
-    }
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/*  Proxy list loading                                                */
-/* ------------------------------------------------------------------ */
-
-async function fetchFreshProxies() {
-  console.log(`📡 Fetching fresh proxies from ${PROXY_SOURCE_URL} ...`);
+async function extractPostDetails(postLink, page) {
   try {
-    const res = await fetch(PROXY_SOURCE_URL, {
-      signal: AbortSignal.timeout(12000),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; proxy-fetcher/1.0)" },
+    console.log(`post link: ${postLink}`);
+
+    await page.goto(postLink, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
 
-    const list = [];
-    for (const line of text.split("\n")) {
-      const m = line.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3}:\d{2,5})\b/);
-      if (m) list.push(m[1]);
+    if (await isCloudflareChallenge(page)) {
+      console.log("🚫 Cloudflare challenge on detail page – skipping this post");
+      return null;
     }
 
-    const unique = [...new Set(list)];
-    console.log(`✅ Loaded ${unique.length} fresh proxies`);
-    return unique;
-  } catch (err) {
-    console.error(`⚠️ Failed to fetch proxies: ${err.message}`);
-    return [];
+    await page.waitForSelector("#jobDetails", {
+      visible: true,
+      timeout: 15000,
+    });
+
+    let post_title = await page.evaluate(() => {
+      const element = document.querySelector(
+        "#jobDetails > div > div:nth-child(1) > div.col-auto.col-md-8"
+      );
+      return element ? element.textContent : null;
+    });
+
+    let post_Inst = await page.evaluate(() => {
+      const element = document.querySelector(
+        "#jobDetails > div > div:nth-child(2) > div.col-auto.col-md-8"
+      );
+      return element ? element.textContent : null;
+    });
+
+    let field = await page.evaluate(() => {
+      const element = document.querySelector(
+        "#jobDetails > div > div:nth-child(7) > div.col-auto.col-md-8"
+      );
+      return element ? element.textContent : null;
+    });
+
+    let app_link = await page.evaluate(() => {
+      const element = document.querySelector(
+        "#gtm-job-ad-apply-now-bottom-section"
+      );
+      return element ? element.href : null;
+    });
+
+    let post_deadline = await page.evaluate(() => {
+      const element = document.querySelector(
+        "#jobDetails > div > div:nth-child(5) > div.col-auto.col-md-8"
+      );
+      return element ? element.textContent : null;
+    });
+
+    if (!post_title || !post_Inst) {
+      console.log("⚠️ Missing title or institution – skipping");
+      return null;
+    }
+
+    return {
+      post_title: post_title.trim(),
+      institution: post_Inst.trim(),
+      field: field ? field.trim() : "Unspecified",
+      application_link: app_link,
+      application_deadline: post_deadline ? post_deadline.trim() : "Unspecified",
+      postLink: postLink,
+      insertionDate: formatDateForDB(),
+    };
+  } catch (error) {
+    console.error(`extractPostDetails error: ${error.message}`);
+    return null;
   }
 }
-
-async function buildProxyCandidateList() {
-  const known = await getTopProxies(40);
-  const fresh = await fetchFreshProxies();
-
-  const seen = new Set();
-  const ordered = [];
-
-  for (const p of known) {
-    if (!seen.has(p)) {
-      seen.add(p);
-      ordered.push(p);
-    }
-  }
-  for (const p of fresh) {
-    if (!seen.has(p)) {
-      seen.add(p);
-      ordered.push(p);
-    }
-  }
-
-  console.log(
-    `📋 Candidate list: ${known.length} known-good + ${fresh.length} fresh → ${ordered.length} total`
-  );
-  return ordered;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Browser launch                                                    */
-/* ------------------------------------------------------------------ */
 
 async function launchBrowserWithProxy(proxy = null) {
   const args = [
@@ -226,49 +260,33 @@ async function launchBrowserWithProxy(proxy = null) {
     "--disable-accelerated-2d-canvas",
     "--disable-gpu",
     "--disable-web-security",
-    "--disable-features=VizDisplayCompositor,AudioServiceOutOfProcess",
-    "--js-flags=--max-old-space-size=192",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--disable-translate",
-    "--mute-audio",
-    "--no-first-run",
-    "--safebrowsing-disable-auto-update",
-    "--disable-ipc-flooding-protection",
-    "--disable-renderer-backgrounding",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-client-side-phishing-detection",
-    "--disable-component-update",
-    "--metrics-recording-only",
-    "--no-default-browser-check",
-    "--no-pings",
+    "--disable-features=VizDisplayCompositor",
+    "--js-flags=--max-old-space-size=384",
   ];
 
   if (proxy) {
     args.push(`--proxy-server=http://${proxy}`);
+    console.log(`🌐 Using proxy: ${proxy}`);
+  } else {
+    console.log(`🌐 No proxy (direct connection)`);
   }
 
   return puppeteer.launch({
     headless: true,
     args,
-    protocolTimeout: 60000, // critical on low-resource hosts
-    timeout: 45000,
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
   });
 }
 
-/* ------------------------------------------------------------------ */
-/*  Single proxy test (sequential only)                               */
-/* ------------------------------------------------------------------ */
-
+/**
+ * Try one proxy. Returns {browser, page, proxy} or null.
+ * Always closes resources on failure.
+ */
 async function tryOneProxy(targetUrl, proxy) {
   let browser = null;
   let page = null;
-  let success = false;
 
   try {
     browser = await launchBrowserWithProxy(proxy);
@@ -277,338 +295,328 @@ async function tryOneProxy(targetUrl, proxy) {
 
     await page.setRequestInterception(true);
     page.on("request", (req) => {
-      const type = req.resourceType();
-      if (
-        ["image", "stylesheet", "font", "media", "websocket", "manifest"].includes(
-          type
-        )
-      ) {
-        req.abort().catch(() => {});
+      if (["image", "stylesheet", "font", "media"].includes(req.resourceType())) {
+        req.abort();
       } else {
-        req.continue().catch(() => {});
+        req.continue();
       }
     });
 
-    const ua = new UserAgent({ deviceCategory: "desktop" });
-    await page.setUserAgent(ua.toString());
+    const userAgent = new UserAgent({ deviceCategory: "mobile" });
+    await page.setUserAgent(userAgent.toString());
 
-    await page.goto(targetUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: PROXY_TEST_TIMEOUT_MS,
-    });
+    console.log(`📄 Navigating to: ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 3500));
 
     if (await isCloudflareChallenge(page)) {
-      console.log(`🚫 CF challenge → ${proxy || "direct"}`);
-      await recordProxyFail(proxy);
+      console.log(`🚫 Cloudflare challenge with proxy ${proxy || "direct"}`);
+      await page.close().catch(() => {});
+      await browser.close().catch(() => {});
       return null;
     }
 
     try {
-      await page.waitForSelector("h2", { visible: true, timeout: 9000 });
-    } catch {
-      console.log(`⚠️ No h2 → soft block ${proxy || "direct"}`);
-      await recordProxyFail(proxy);
+      await page.waitForSelector("h2", { visible: true, timeout: 12000 });
+    } catch (e) {
+      console.log(`⚠️ h2 not found with proxy ${proxy || "direct"} – soft block`);
+      await page.close().catch(() => {});
+      await browser.close().catch(() => {});
       return null;
     }
 
-    console.log(`✅ Working proxy found: ${proxy || "direct"}`);
-    await recordProxySuccess(proxy);
-    success = true;
+    console.log(`✅ Browser ready (proxy: ${proxy || "direct"})`);
     return { browser, page, proxy };
   } catch (err) {
-    const msg = (err.message || "").slice(0, 120);
-    console.log(`❌ Proxy failed ${proxy || "direct"}: ${msg}`);
-    await recordProxyFail(proxy);
+    console.error(`❌ Failed with proxy ${proxy || "direct"}: ${err.message}`);
+    try {
+      if (page) await page.close().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+    } catch (_) {}
     return null;
-  } finally {
-    if (!success) {
-      try {
-        if (page) await page.close().catch(() => {});
-        if (browser) await browser.close().catch(() => {});
-      } catch (_) {}
-    }
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Find a working browser                                            */
-/* ------------------------------------------------------------------ */
-
+/**
+ * Walk the full proxy list in batches of BATCH_SIZE until a working proxy is found.
+ * Once found, that proxy is remembered (in-memory + DB) and reused for the rest of the run.
+ */
 async function createWorkingBrowserAndPage(targetUrl) {
-  // Fast path – reuse last working proxy from this process
+  // Fast path: already have a known-good proxy from earlier in this process (or loaded from DB)
   if (lastWorkingProxy) {
-    console.log(`🔁 Trying last working proxy: ${lastWorkingProxy}`);
+    console.log(`🔁 Reusing last working proxy: ${lastWorkingProxy}`);
     const result = await tryOneProxy(targetUrl, lastWorkingProxy);
     if (result) return result;
-    console.log("⚠️ Last working proxy died");
-    lastWorkingProxy = null;
-  }
-
-  if (allProxies.length === 0) {
-    console.log("⚠️ No proxies available – trying direct");
-    const direct = await tryOneProxy(targetUrl, null);
-    if (direct) return direct;
-    throw new Error("No proxies and direct connection blocked");
-  }
-
-  // Sequential testing (concurrency = 1)
-  while (proxyCursor < allProxies.length) {
-    const proxy = allProxies[proxyCursor];
-    proxyCursor++;
-
     console.log(
-      `\n📦 Testing proxy ${proxyCursor}/${allProxies.length}: ${proxy}`
+      `⚠️ Last working proxy died – clearing from DB and searching for a new one...`
     );
-
-    const alive = await tcpConnectCheck(proxy, 2800);
-    if (!alive) {
-      console.log("   TCP failed – skipping");
-      await recordProxyFail(proxy);
-      continue;
-    }
-
-    const result = await tryOneProxy(targetUrl, proxy);
-    if (result) {
-      lastWorkingProxy = result.proxy;
-      // Move winner to front of list
-      allProxies = allProxies.filter((p) => p !== result.proxy);
-      allProxies.unshift(result.proxy);
-      proxyCursor = 0;
-      return result;
-    }
-
+    lastWorkingProxy = null;
+    await clearWorkingProxy(); // persist the failure so next run doesn't reuse a dead proxy
     await new Promise((r) => setTimeout(r, COOLDOWN_MS));
   }
 
-  // Last resort
-  console.log("⚠️ Exhausted proxy list – trying direct connection");
+  if (allProxies.length === 0) {
+    console.log("⚠️ No proxies loaded – trying direct connection");
+    const direct = await tryOneProxy(targetUrl, null);
+    if (direct) return direct;
+    throw new Error("No proxies available and direct connection blocked");
+  }
+
+  // Walk the list in batches
+  while (proxyCursor < allProxies.length) {
+    const batchStart = proxyCursor;
+    const batchEnd = Math.min(proxyCursor + BATCH_SIZE, allProxies.length);
+    const batch = allProxies.slice(batchStart, batchEnd);
+
+    console.log(
+      `\n📦 Trying proxy batch ${Math.floor(batchStart / BATCH_SIZE) + 1} ` +
+        `(indices ${batchStart}-${batchEnd - 1} of ${allProxies.length})`
+    );
+    console.log(`📋 Batch proxies:`, JSON.stringify(batch, null, 2));
+
+    for (const proxy of batch) {
+      const result = await tryOneProxy(targetUrl, proxy);
+      if (result) {
+        lastWorkingProxy = result.proxy;
+        // Move this working proxy to the front for future restarts
+        allProxies = allProxies.filter((p) => p !== result.proxy);
+        allProxies.unshift(result.proxy);
+        proxyCursor = 0; // next time we start from the good one
+        console.log(`🎉 Found working proxy: ${result.proxy} – will reuse it`);
+        await saveWorkingProxy(result.proxy); // persist so it survives process restarts
+        return result;
+      }
+      await new Promise((r) => setTimeout(r, COOLDOWN_MS));
+    }
+
+    proxyCursor = batchEnd;
+    console.log(`📦 Batch exhausted. Moving to next batch...`);
+  }
+
+  // Entire list exhausted – last resort direct
+  console.log("⚠️ Entire proxy list exhausted. Trying direct connection...");
   const direct = await tryOneProxy(targetUrl, null);
   if (direct) {
     lastWorkingProxy = null;
+    await clearWorkingProxy(); // no proxy in use
     return direct;
   }
 
-  throw new Error("Could not obtain a working browser after testing all proxies");
+  throw new Error(
+    "Could not obtain a working browser/page after trying all proxies"
+  );
 }
 
-/* ------------------------------------------------------------------ */
-/*  Detail page extraction                                            */
-/* ------------------------------------------------------------------ */
-
-async function extractPostDetails(postLink, page) {
-  try {
-    await page.goto(postLink, {
-      waitUntil: "domcontentloaded",
-      timeout: DETAIL_NAV_TIMEOUT,
-    });
-
-    if (await isCloudflareChallenge(page)) {
-      console.log("🚫 CF on detail page – skip");
-      return null;
-    }
-
-    await page.waitForSelector("#jobDetails", {
-      visible: true,
-      timeout: 10000,
-    });
-
-    const data = await page.evaluate(() => {
-      const getText = (sel) => {
-        const el = document.querySelector(sel);
-        return el ? el.textContent.trim() : null;
-      };
-
-      return {
-        post_title: getText(
-          "#jobDetails > div > div:nth-child(1) > div.col-auto.col-md-8"
-        ),
-        institution: getText(
-          "#jobDetails > div > div:nth-child(2) > div.col-auto.col-md-8"
-        ),
-        field: getText(
-          "#jobDetails > div > div:nth-child(7) > div.col-auto.col-md-8"
-        ),
-        application_deadline: getText(
-          "#jobDetails > div > div:nth-child(5) > div.col-auto.col-md-8"
-        ),
-        application_link:
-          document.querySelector("#gtm-job-ad-apply-now-bottom-section")
-            ?.href || null,
-      };
-    });
-
-    if (!data.post_title || !data.institution) {
-      console.log("⚠️ Missing title or institution – skip");
-      return null;
-    }
-
-    return {
-      post_title: data.post_title,
-      institution: data.institution,
-      field: data.field || "Unspecified",
-      application_link: data.application_link,
-      application_deadline: data.application_deadline || "Unspecified",
-      postLink,
-      insertionDate: formatDateForDB(),
-    };
-  } catch (err) {
-    console.error(`extractPostDetails error: ${err.message}`);
-    return null;
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Main scraping loop                                                */
-/* ------------------------------------------------------------------ */
-
-async function scrapeAllPages(startUrl, maxPages = MAX_PAGES) {
+async function scrapeAllPages(startUrl, maxPages = 10) {
   let browser = null;
   let page = null;
   let postsSinceRestart = 0;
-  let currentUrl = startUrl;
-  let pageNum = 1;
-
-  const stockLink = "https://academicpositions.com/jobs/position/phd?page=";
 
   try {
+    let currentUrl = startUrl;
+    let pageNum = 1;
+    const stockLink = "https://academicpositions.com/jobs/position/phd?page=";
+
     while (pageNum <= maxPages) {
-      console.log(`\n========== PAGE ${pageNum}/${maxPages} ==========`);
+      console.log(`\n📄 Scraping page ${pageNum}`);
       logMemory(`start page ${pageNum}`);
 
-      // Obtain (or re-obtain) a working browser
-      if (!browser || !page) {
-        try {
-          const result = await createWorkingBrowserAndPage(currentUrl);
-          browser = result.browser;
-          page = result.page;
-          postsSinceRestart = 0;
-        } catch (err) {
-          console.error(
-            `🚫 Cannot get working browser for page ${pageNum}: ${err.message}`
-          );
-          break;
-        }
-      } else {
-        // Reuse existing browser
-        try {
-          await page.goto(currentUrl, {
-            waitUntil: "domcontentloaded",
-            timeout: LISTING_NAV_TIMEOUT,
-          });
-          if (await isCloudflareChallenge(page)) {
-            console.log("🚫 CF reappeared – forcing new proxy");
-            await page.close().catch(() => {});
-            await browser.close().catch(() => {});
-            browser = null;
-            page = null;
-            continue;
-          }
-        } catch (navErr) {
-          console.error("Listing navigation failed – restarting browser");
-          await page.close().catch(() => {});
-          await browser.close().catch(() => {});
-          browser = null;
-          page = null;
-          continue;
-        }
+      try {
+        const result = await createWorkingBrowserAndPage(currentUrl);
+        browser = result.browser;
+        page = result.page;
+        postsSinceRestart = 0;
+      } catch (err) {
+        console.error(
+          `🚫 Failed to get working page for listing ${pageNum}: ${err.message}`
+        );
+        break;
       }
 
-      // Extract links
+      if (await isCloudflareChallenge(page)) {
+        console.log(
+          "🚫 Still blocked by Cloudflare after all attempts. Aborting."
+        );
+        break;
+      }
+
+      await page
+        .waitForSelector("h2", {
+          visible: true,
+          timeout: 20000,
+        })
+        .catch(() => console.log("h2 wait timed out"));
+
       let links = await page
         .evaluate(() => {
-          const els = document.querySelectorAll(
+          let jobListingElements = document.querySelectorAll(
             ".list-group-item.text-reset.text-decoration-none > a"
           );
-          return Array.from(els)
-            .map((a) => a.href)
-            .filter(Boolean);
+          let extractedLinks = [];
+          jobListingElements.forEach((link) => {
+            if (link.href) extractedLinks.push(link.href);
+          });
+          return extractedLinks;
         })
         .catch(() => []);
 
       if (links.length > LINKS_PER_PAGE) {
+        console.log(
+          `Found ${links.length} job links – limiting to first ${LINKS_PER_PAGE}`
+        );
         links = links.slice(0, LINKS_PER_PAGE);
+      } else {
+        console.log(`Found ${links.length} job links on page ${pageNum}`);
       }
-      console.log(`Found ${links.length} job links`);
 
-      const postsDetailsArr = [];
+      if (links.length === 0) {
+        const debug = await page
+          .evaluate(() => ({
+            title: document.title,
+            url: location.href,
+            bodyText: document.body ? document.body.innerText.slice(0, 500) : "",
+            listItems: document.querySelectorAll(".list-group-item").length,
+          }))
+          .catch(() => ({}));
+        console.log("DEBUG (empty links):", JSON.stringify(debug, null, 2));
+      }
+
+      let postsDetailsArr = [];
 
       for (let i = 0; i < links.length; i++) {
-        // Memory / restart guard
-        const mem = process.memoryUsage().rss / 1024 / 1024;
-        if (
-          postsSinceRestart >= BROWSER_RESTART_EVERY ||
-          mem > MEMORY_LIMIT_MB
-        ) {
+        console.log(`\n📌 Processing post ${i + 1}/${links.length}`);
+
+        if (postsSinceRestart >= BROWSER_RESTART_EVERY) {
           console.log(
-            `♻️ Restarting browser (posts=${postsSinceRestart}, rss=${mem.toFixed(
-              0
-            )}MB)`
+            `♻️ Restarting browser after ${postsSinceRestart} posts (memory hygiene)`
           );
           logMemory("before restart");
 
-          await page.close().catch(() => {});
-          await browser.close().catch(() => {});
-          if (global.gc) global.gc();
+          try {
+            if (page) await page.close().catch(() => {});
+            if (browser) await browser.close().catch(() => {});
+          } catch (_) {}
 
-          await new Promise((r) => setTimeout(r, 2500));
+          if (global.gc) {
+            global.gc();
+            console.log("🗑️ Forced garbage collection");
+          }
+
+          await new Promise((r) => setTimeout(r, 3000));
 
           try {
+            // Will reuse lastWorkingProxy if still alive
             const result = await createWorkingBrowserAndPage(currentUrl);
             browser = result.browser;
             page = result.page;
             postsSinceRestart = 0;
             logMemory("after restart");
           } catch (err) {
-            console.error(`Could not restart: ${err.message}`);
+            console.error(`🚫 Could not restart browser: ${err.message}`);
             break;
           }
         }
 
-        console.log(`📌 ${i + 1}/${links.length}`);
-        const detail = await extractPostDetails(links[i], page);
-        if (detail) {
-          postsDetailsArr.push(detail);
-          console.log(`✅ ${detail.post_title.slice(0, 65)}...`);
+        try {
+          const result = await extractPostDetails(links[i], page);
+          if (result) {
+            postsDetailsArr.push(result);
+            console.log(`✅ Post ${i + 1} added successfully`);
+          } else {
+            console.log(`⏭️ Post ${i + 1} skipped`);
+          }
+        } catch (err) {
+          console.error(
+            `❌ Unexpected error on post ${i + 1}: ${err.message}`
+          );
+
+          try {
+            if (page) await page.close().catch(() => {});
+            page = await browser.newPage();
+            page.setDefaultNavigationTimeout(0);
+            await page.setRequestInterception(true);
+            page.on("request", (req) => {
+              if (
+                ["image", "stylesheet", "font", "media"].includes(
+                  req.resourceType()
+                )
+              ) {
+                req.abort();
+              } else {
+                req.continue();
+              }
+            });
+            const userAgent = new UserAgent({ deviceCategory: "mobile" });
+            await page.setUserAgent(userAgent.toString());
+            console.log("🔄 Recreated page after error");
+          } catch (recoverErr) {
+            console.error(`Could not recover page: ${recoverErr.message}`);
+            postsSinceRestart = BROWSER_RESTART_EVERY;
+          }
         }
 
         postsSinceRestart++;
-        await new Promise((r) => setTimeout(r, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        if ((i + 1) % 5 === 0) {
+          logMemory(`after post ${i + 1}`);
+        }
       }
 
-      // Clean + store
-      let cleaned = cleanJobData(postsDetailsArr);
-      cleaned = filterExpiredDeadlines(cleaned);
-      cleaned = cleaned.filter((p) => p.application_deadline !== "Unspecified");
+      console.log(`\n🎉 Extraction complete for page ${pageNum}!`);
+      console.log(`Total posts collected: ${postsDetailsArr.length}`);
 
-      console.log(`✅ Valid posts this page: ${cleaned.length}`);
+      postsDetailsArr = cleanJobData(postsDetailsArr);
+      postsDetailsArr = filterExpiredDeadlines(postsDetailsArr);
+      postsDetailsArr = postsDetailsArr.filter(
+        (p) => p.application_deadline !== "Unspecified"
+      );
+
+      console.log(
+        `✅ Total valid posts after filtering: ${postsDetailsArr.length}`
+      );
 
       try {
         await checkPostsCount();
-        const result = await storePosts(cleaned);
-        console.log(
-          result?.success
-            ? `Stored ${result.inserted} new documents`
-            : `Store result: ${JSON.stringify(result)}`
-        );
+        let result = await storePosts(postsDetailsArr);
+        if (result && result.success && result.inserted) {
+          console.log(
+            `successfully stored posts ..${result.inserted}\nDetails: \n`,
+            result
+          );
+        } else {
+          console.log(
+            "No new documents available to insert at this time..",
+            result
+          );
+        }
       } catch (dbErr) {
         console.error("DB error (continuing):", dbErr.message);
       }
 
-      // Next page
+      try {
+        if (page) await page.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
+        browser = null;
+        page = null;
+      } catch (_) {}
+
+      if (global.gc) global.gc();
+      await new Promise((r) => setTimeout(r, 4000));
+
       if (pageNum < maxPages) {
         pageNum++;
-        currentUrl = stockLink + pageNum;
-        console.log(`🔗 Next: ${currentUrl}`);
+        const nextPageLink = stockLink + `${pageNum}`;
+        console.log(`🔗 Next page link: ${nextPageLink}`);
+        currentUrl = nextPageLink;
       } else {
+        console.log(`📌 Reached max pages (${maxPages})`);
         break;
       }
-
-      await new Promise((r) => setTimeout(r, 1500));
     }
   } catch (error) {
-    console.error("scrapeAllPages fatal:", error.message);
+    console.error("scrapeAllPages fatal error:", error.message);
   } finally {
     try {
       if (page) await page.close().catch(() => {});
@@ -619,23 +627,25 @@ async function scrapeAllPages(startUrl, maxPages = MAX_PAGES) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Entry point                                                       */
-/* ------------------------------------------------------------------ */
-
 async function academy() {
   try {
+    // DB first so we can restore the last working proxy across restarts
     await initializeDatabase();
-    await pruneProxyCache();
 
-    allProxies = await buildProxyCandidateList();
+    // Restore persisted working proxy (if any) before building the proxy list
+    lastWorkingProxy = await getWorkingProxy();
+
+    // Fetch the FULL list once per run (website order).
+    // fetchFreshProxies() will put lastWorkingProxy at the front when present.
+    allProxies = await fetchFreshProxies();
     proxyCursor = 0;
 
-    const baseUrl = "https://academicpositions.com/jobs/position/phd?page=1";
-    await scrapeAllPages(baseUrl, MAX_PAGES);
+    const baseUrl = "https://academicpositions.com/jobs/position/phd?page=";
+    await scrapeAllPages(baseUrl + "1", 2);
 
     await closeDatabase();
-    console.log("Academy scraper finished cleanly.");
+    console.log("Academy scraper finished cleanly. Returning to outer scope...");
+    return;
   } catch (error) {
     console.error("Academy top-level error:", error.message);
     throw error;

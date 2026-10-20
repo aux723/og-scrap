@@ -1,5 +1,6 @@
 const { MongoClient } = require("mongodb");
 require("dotenv").config();
+// Use environment variable for the database URI for security
 
 const uri = process.env.MONGODB_URI;
 if (!uri) {
@@ -7,14 +8,14 @@ if (!uri) {
 }
 
 let client = new MongoClient(uri, {
-  maxPoolSize: 6,
-  minPoolSize: 1,
+  maxPoolSize: 10,
+  minPoolSize: 2,
   maxIdleTimeMS: 30000,
-  serverSelectionTimeoutMS: 20000,
-  socketTimeoutMS: 30000,
+  serverSelectionTimeoutMS: 45000,
+  socketTimeoutMS: 45000,
 });
 
-let db;
+let db; // This variable will hold the database instance once connected
 
 /**
  * Connects to the MongoDB database. Should be called once at application startup.
@@ -23,6 +24,8 @@ async function initializeDatabase() {
   try {
     await client.connect();
     db = client.db("academy-db");
+
+    // Create indexes for better query performance
     await createIndexes();
     console.log("✅ Successfully connected to MongoDB Atlas!");
   } catch (error) {
@@ -32,42 +35,42 @@ async function initializeDatabase() {
 }
 
 /**
- * Creates necessary indexes
+ * Creates necessary indexes for optimal query performance
  */
 async function createIndexes() {
   try {
-    const scholarships = db.collection("academy-db-scholarships");
-    const proxyCache = db.collection("proxy-cache");
+    let academyDB_Collection = db.collection("academy-db-scholarships");
 
+    // Create indexes in parallel for better performance
     await Promise.all([
-      scholarships.createIndex({ post_title: 1 }, { background: true }),
-      scholarships.createIndex({ application_deadline: 1 }, { background: true }),
-      scholarships.createIndex({ application_link: 1 }, { unique: true, background: true }),
-
-      proxyCache.createIndex({ proxy: 1 }, { unique: true, background: true }),
-      proxyCache.createIndex({ score: -1, lastSuccess: -1 }, { background: true }),
-      proxyCache.createIndex({ lastTested: 1 }, { background: true }),
+      academyDB_Collection.createIndex({ post_title: 1 }, { background: true }),
+      academyDB_Collection.createIndex({ application_deadline: 1 }, { background: true }),
+      academyDB_Collection.createIndex({ application_link: 1 }, { unique: true, background: true }),
     ]);
 
     console.log("✅ Database indexing configuration completed");
+    return;
+    // For Posted-Jobs, we'll create the index when the collection is first used
+    // This is handled in addDocumentToPostedDb function
   } catch (error) {
     console.error("⛔ Error configuring indexes:", error);
+    // Non-critical error, don't throw
     console.log("ℹ️ Application will continue without optimal indexes");
   }
 }
 
+/**
+ * Closes the MongoDB connection. Should be called once during application shutdown.
+ */
 async function closeDatabase() {
   try {
     await client.close();
     console.log("🔌 MongoDB connection closed.");
   } catch (error) {
     console.error("⛔ Error closing MongoDB connection:", error);
+    process.exit(1);
   }
 }
-
-/* ------------------------------------------------------------------ */
-/*  Scholarship storage                                               */
-/* ------------------------------------------------------------------ */
 
 async function storePosts(postsArr) {
   const posts = Array.isArray(postsArr) ? postsArr : [postsArr];
@@ -83,9 +86,7 @@ async function storePosts(postsArr) {
   }
 
   try {
-    const result = await db
-      .collection("academy-db-scholarships")
-      .insertMany(posts, { ordered: false });
+    const result = await db.collection("academy-db-scholarships").insertMany(posts, { ordered: false });
 
     return {
       success: true,
@@ -95,21 +96,22 @@ async function storePosts(postsArr) {
       errors: 0,
     };
   } catch (error) {
+    // If the error is a bulk write error (some succeeded, some failed)
     if (error.name === "MongoBulkWriteError" || error.result) {
-      const inserted = error.result?.insertedCount || 0;
-      const duplicateCount =
-        error.writeErrors?.filter((err) => err.code === 11000).length || 0;
+      const inserted = error.result.insertedCount;
+      const duplicateCount = error.writeErrors?.filter((err) => err.code === 11000).length || 0;
       const otherErrors = (error.writeErrors?.length || 0) - duplicateCount;
 
       return {
         success: true,
         message: `Processed ${posts.length} scholar post(s) with partial successes`,
-        inserted,
+        inserted: inserted,
         duplicates: duplicateCount,
         errors: otherErrors,
       };
     }
 
+    // Handle complete system/connection failures
     console.error("Critical error in storage operation:", error.message);
     return {
       success: false,
@@ -122,130 +124,93 @@ async function storePosts(postsArr) {
 
 async function checkPostsCount() {
   try {
-    const sa_Collection = db.collection("academy-db-scholarships");
-    const count = await sa_Collection.estimatedDocumentCount();
+    // Get collection from the shared 'db' instance
+    let sa_Collection = db.collection("academy-db-scholarships");
+
+    // Use estimatedDocumentCount for better performance on large collections
+    let count = await sa_Collection.estimatedDocumentCount();
 
     if (count > 10000) {
-      console.log(`🗑️ Collection has ~${count} documents. Deleting...`);
-      const result = await sa_Collection.deleteMany(
+      console.log(`🗑️ Posted-Jobs collection has ~${count} documents. Deleting...`);
+
+      let result = await sa_Collection.deleteMany(
         {},
-        { writeConcern: { w: 1, j: false } }
+        {
+          writeConcern: { w: 1, j: false },
+        }
       );
-      console.log(`✅ Deleted ${result.deletedCount} documents.`);
+
+      console.log(`✅ Deleted ${result.deletedCount} documents from Posted-Jobs.`);
+      sa_Collection = null;
     } else {
-      console.log(`Documents within threshold (10,000). Current count: ${count}`);
+      console.log(
+        `Documents are within the target count threshold (10,000 docs)\ncurrent count: `,
+        count
+      );
     }
   } catch (error) {
-    console.error("⛔ Error managing collection size:", error.message);
+    console.error("⛔ Error managing Posted-Jobs collection:", error.message);
+    process.exit(1);
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Proxy cache                                                       */
-/* ------------------------------------------------------------------ */
+// -------------------------------------------------------
+// Persistent working-proxy storage (survives process restarts)
+// Collection: academy-db-config  |  document _id: "workingProxy"
+// -------------------------------------------------------
 
-async function getTopProxies(limit = 40) {
+/**
+ * Retrieve the last known working proxy from the database.
+ * @returns {Promise<string|null>} proxy string (ip:port) or null
+ */
+async function getWorkingProxy() {
   try {
-    const coll = db.collection("proxy-cache");
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-    const docs = await coll
-      .find({
-        lastSuccess: { $gte: sevenDaysAgo },
-        successCount: { $gt: 0 },
-      })
-      .sort({ score: -1, lastSuccess: -1 })
-      .limit(limit)
-      .toArray();
-
-    return docs.map((d) => d.proxy);
-  } catch (err) {
-    console.error("getTopProxies error:", err.message);
-    return [];
+    const doc = await db.collection("academy-db-config").findOne({ _id: "workingProxy" });
+    if (doc && doc.proxy) {
+      console.log(`📂 Loaded persisted working proxy from DB: ${doc.proxy}`);
+      return doc.proxy;
+    }
+    return null;
+  } catch (error) {
+    console.error("⛔ Error reading working proxy from DB:", error.message);
+    return null;
   }
 }
 
-async function recordProxySuccess(proxy) {
-  if (!proxy) return;
+/**
+ * Persist (upsert) the current working proxy.
+ * @param {string|null} proxy  ip:port string, or null to clear
+ */
+async function saveWorkingProxy(proxy) {
   try {
-    const coll = db.collection("proxy-cache");
-    const now = new Date();
+    if (!proxy) {
+      await db.collection("academy-db-config").deleteOne({ _id: "workingProxy" });
+      console.log("🗑️ Cleared persisted working proxy from DB");
+      return;
+    }
 
-    await coll.updateOne(
-      { proxy },
+    await db.collection("academy-db-config").updateOne(
+      { _id: "workingProxy" },
       {
-        $inc: { successCount: 1 },
         $set: {
-          lastSuccess: now,
-          lastTested: now,
-        },
-        $setOnInsert: {
-          failCount: 0,
-          createdAt: now,
+          proxy,
+          updatedAt: new Date(),
         },
       },
       { upsert: true }
     );
-
-    const doc = await coll.findOne({ proxy });
-    if (doc) {
-      const total = doc.successCount + (doc.failCount || 0);
-      const successRate = total === 0 ? 0 : doc.successCount / total;
-      const ageHours =
-        (Date.now() - new Date(doc.lastSuccess).getTime()) / 3600000;
-      const recency = Math.max(0.15, 1 - ageHours / (7 * 24));
-      const score = successRate * 0.7 + recency * 0.3;
-
-      await coll.updateOne({ proxy }, { $set: { score } });
-    }
-  } catch (err) {
-    console.error("recordProxySuccess error:", err.message);
+    console.log(`💾 Persisted working proxy to DB: ${proxy}`);
+  } catch (error) {
+    console.error("⛔ Error saving working proxy to DB:", error.message);
+    // Non-critical – continue without persistence
   }
 }
 
-async function recordProxyFail(proxy) {
-  if (!proxy) return;
-  try {
-    const coll = db.collection("proxy-cache");
-    const now = new Date();
-
-    await coll.updateOne(
-      { proxy },
-      {
-        $inc: { failCount: 1 },
-        $set: { lastTested: now },
-        $setOnInsert: {
-          successCount: 0,
-          createdAt: now,
-          lastSuccess: null,
-          score: 0,
-        },
-      },
-      { upsert: true }
-    );
-  } catch (err) {
-    console.error("recordProxyFail error:", err.message);
-  }
-}
-
-async function pruneProxyCache() {
-  try {
-    const coll = db.collection("proxy-cache");
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
-    const result = await coll.deleteMany({
-      $or: [
-        { lastSuccess: null, createdAt: { $lt: thirtyDaysAgo } },
-        { lastSuccess: { $lt: thirtyDaysAgo }, successCount: { $lt: 2 } },
-      ],
-    });
-
-    if (result.deletedCount > 0) {
-      console.log(`🧹 Pruned ${result.deletedCount} stale proxies from cache`);
-    }
-  } catch (err) {
-    // non-critical
-  }
+/**
+ * Clear the persisted working proxy (e.g. when it fails).
+ */
+async function clearWorkingProxy() {
+  return saveWorkingProxy(null);
 }
 
 module.exports = {
@@ -253,8 +218,7 @@ module.exports = {
   closeDatabase,
   storePosts,
   checkPostsCount,
-  getTopProxies,
-  recordProxySuccess,
-  recordProxyFail,
-  pruneProxyCache,
+  getWorkingProxy,
+  saveWorkingProxy,
+  clearWorkingProxy,
 };
