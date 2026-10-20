@@ -4,7 +4,7 @@ const { base_scraper } = require("./scrapers/scholarships-future/sft-main.js");
 const { sa_base_scraper } = require("./scrapers/scholarships-aid/sa-main.js");
 const { get_jobs_ac_data } = require("./scrapers/jobs-ac/jobs-ac-main.js");
 const { scrap_predoc } = require("./scrapers/predoc/predoc-main.js");
-const { academy } = require("./scrapers/academy-pos/academy-main.js");
+//const { academy } = require("./scrapers/academy-pos/academy-main.js");
 const { getNigerianTime, formatNigerianTime } = require("./utils/dateHelpers.js");
 const http = require("http");
 
@@ -79,7 +79,7 @@ async function runAndExit(fn, label) {
 }
 
 
-/*async function setupCronJobs() {
+async function setupCronJobs() {
   cron.schedule(
     "0 3 * * *",
     async () => {
@@ -94,15 +94,6 @@ async function runAndExit(fn, label) {
     async () => {
       console.log("🌅 5:00 AM - SFT scraper running..");
       await runAndExit(base_scraper, "base_scraper");
-    },
-    { scheduled: true, timezone: "Africa/Lagos" }
-  );
-
-  cron.schedule(
-    "0 8 * * *",
-    async () => {
-      console.log("🌅 8:00 AM - academicpositions.com scraper running..");
-      await runAndExit(academy, "academy");
     },
     { scheduled: true, timezone: "Africa/Lagos" }
   );
@@ -128,10 +119,9 @@ async function runAndExit(fn, label) {
   console.log("📅 Daily Schedule (Africa/Lagos):");
   console.log("   - 3:00 AM  → Scholarship-aid");
   console.log("   - 5:00 AM  → SFT");
-  console.log("   - 8:00 AM  → AcademicPositions (academy)");
   console.log("   - 6:00 PM  → Predoc");
   console.log("   - 10:00 PM → Jobs-ac");
-}*/
+}
 
 // --- Server Startup and Graceful Shutdown ---
 async function startServer() {
@@ -142,13 +132,7 @@ async function startServer() {
       console.log(`🟢 Server is live on port ${PORT}`);
       console.log(`⏰ Current Nigerian time: ${formatNigerianTime()}`);
       console.log(`running acad-pos..`);
-      
-      try {
-        await academy();
-      } catch (error) {
-        console.error (error.message)
-      }
-      //await setupCronJobs();
+      await setupCronJobs();
     });
 
     const shutdown = async () => {
