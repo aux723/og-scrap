@@ -10,7 +10,6 @@ const {
   checkPostsCount,
   initializeDatabase,
   closeDatabase,
-  getProxyBatchIndex,
   saveProxyBatchIndex,
   clearProxyBatchIndex,
 } = require("./academy-db.js");
@@ -26,13 +25,17 @@ const {
 // it is discarded and search resumes from that same batch.
 //
 // Lifecycle per listing page:
-//   open browser -> scrape details (recycle page every 10) ->
+//   open browser -> scrape details (full browser restart + GC every 6 posts) ->
 //   store posts -> close browser
 // Then move to the next listing page and open a fresh browser.
+//
+// Batch index: cleared on every process start (crash/restart-safe).
+// Saved during the run when a working proxy is found; cleared again
+// after all listing pages complete.
 // -------------------------------------------------------
 const PROXY_SOURCE_URL = "https://spys.me/proxy.txt";
 const BATCH_SIZE = 25; // try 25 at a time
-const PAGE_RECYCLE_EVERY = 10; // recreate page every N detail posts (cheap)
+const BROWSER_RESTART_EVERY = 6; // full browser restart + GC every N detail posts
 const LINKS_PER_PAGE = 20; // max job links per listing page
 const COOLDOWN_MS = 2000; // pause between failed proxy attempts
 const DETAIL_CF_RETRIES = 2; // how many times to rotate proxy + retry a CF'd detail page
@@ -467,7 +470,7 @@ async function closeBrowserResources(browser, page) {
 async function scrapeAllPages(startUrl, maxPages = 10) {
   let browser = null;
   let page = null;
-  let postsSincePageRecycle = 0;
+  let postsSinceBrowserRestart = 0;
 
   try {
     let currentUrl = startUrl;
@@ -483,7 +486,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
         const result = await createWorkingBrowserAndPage(currentUrl);
         browser = result.browser;
         page = result.page;
-        postsSincePageRecycle = 0;
+        postsSinceBrowserRestart = 0;
         console.log(`🌐 Browser opened for listing page ${pageNum}`);
       } catch (err) {
         console.error(
@@ -543,36 +546,34 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
         console.log("DEBUG (empty links):", JSON.stringify(debug, null, 2));
       }
 
-      // 2) SCRAPE DETAILS (recycle page every PAGE_RECYCLE_EVERY posts)
+      // 2) SCRAPE DETAILS (full browser restart + GC every BROWSER_RESTART_EVERY posts)
       let postsDetailsArr = [];
 
       for (let i = 0; i < links.length; i++) {
         console.log(`\n📌 Processing post ${i + 1}/${links.length}`);
 
-        if (postsSincePageRecycle >= PAGE_RECYCLE_EVERY) {
+        if (postsSinceBrowserRestart >= BROWSER_RESTART_EVERY) {
           console.log(
-            `♻️ Recycling page after ${postsSincePageRecycle} posts (cheap)`
+            `♻️ Restarting browser after ${postsSinceBrowserRestart} posts (memory hygiene)`
           );
+          logMemory("before browser restart");
+          await closeBrowserResources(browser, page);
+          browser = null;
+          page = null;
+          if (global.gc) {
+            global.gc();
+            console.log("🗑️ Forced garbage collection");
+          }
+          await new Promise((r) => setTimeout(r, 2000));
           try {
-            if (page) await page.close().catch(() => {});
-            page = await createFreshPage(browser);
-            postsSincePageRecycle = 0;
-          } catch (recycleErr) {
-            console.error(
-              `Page recycle failed: ${recycleErr.message} – rotating browser`
-            );
-            await closeBrowserResources(browser, page);
-            browser = null;
-            page = null;
-            try {
-              const rotated = await createWorkingBrowserAndPage(currentUrl);
-              browser = rotated.browser;
-              page = rotated.page;
-              postsSincePageRecycle = 0;
-            } catch (err) {
-              console.error(`🚫 Could not recover browser: ${err.message}`);
-              break;
-            }
+            const restarted = await createWorkingBrowserAndPage(currentUrl);
+            browser = restarted.browser;
+            page = restarted.page;
+            postsSinceBrowserRestart = 0;
+            logMemory("after browser restart");
+          } catch (err) {
+            console.error(`🚫 Could not restart browser: ${err.message}`);
+            break;
           }
         }
 
@@ -607,7 +608,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
                 const rotated = await createWorkingBrowserAndPage(currentUrl);
                 browser = rotated.browser;
                 page = rotated.page;
-                postsSincePageRecycle = 0;
+                postsSinceBrowserRestart = 0;
               } catch (rotateErr) {
                 console.error(
                   `🚫 Could not obtain new proxy after CF: ${rotateErr.message}`
@@ -627,7 +628,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
               if (page) await page.close().catch(() => {});
               page = await createFreshPage(browser);
               console.log("🔄 Recreated page after error");
-              postsSincePageRecycle = 0;
+              postsSinceBrowserRestart = 0;
             } catch (recoverErr) {
               console.error(`Could not recover page: ${recoverErr.message}`);
               await closeBrowserResources(browser, page);
@@ -637,7 +638,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
                 const rotated = await createWorkingBrowserAndPage(currentUrl);
                 browser = rotated.browser;
                 page = rotated.page;
-                postsSincePageRecycle = 0;
+                postsSinceBrowserRestart = 0;
               } catch (e) {
                 console.error(`🚫 Could not recover browser: ${e.message}`);
               }
@@ -654,7 +655,7 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
           console.log(`⏭️ Post ${i + 1} skipped`);
         }
 
-        postsSincePageRecycle++;
+        postsSinceBrowserRestart++;
         await new Promise((resolve) => setTimeout(resolve, 1500));
 
         if ((i + 1) % 5 === 0) {
@@ -735,12 +736,15 @@ async function scrapeAllPages(startUrl, maxPages = 10) {
 
 async function academy() {
   try {
-    // DB first so we can restore the batch index across restarts
+    // DB first
     await initializeDatabase();
 
-    // Restore only the batch index (proxies are never persisted)
-    lastGoodBatchIndex = await getProxyBatchIndex();
-    proxyCursor = lastGoodBatchIndex;
+    // On every process start (new deploy or post-crash restart): clear any
+    // leftover batch index so proxy search always begins at the first batch.
+    // Mid-run saves still happen while scraping; cleared again on completion.
+    await clearProxyBatchIndex();
+    lastGoodBatchIndex = 0;
+    proxyCursor = 0;
     lastWorkingProxy = null;
     proxyFailCount = 0;
 
